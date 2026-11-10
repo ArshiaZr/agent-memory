@@ -34,7 +34,6 @@ from jiuwen_memory.common.type_def import (
     Scope,
     Segment,
 )
-from jiuwen_memory.common.type_def.memory_filter import matches_memory_unit
 from jiuwen_memory.config.document_flag import resolve_index_builder_default
 from jiuwen_memory.construction import EvolveMode
 from jiuwen_memory.construction.classifier import Classifier, ClassifierProducer
@@ -46,12 +45,23 @@ from jiuwen_memory.control.engine import EngineProducer, MemoryEngine
 from jiuwen_memory.control.engine_impl.evolve_dispatch import submit_evolve
 from jiuwen_memory.control.engine_impl.list_support import list_page
 from jiuwen_memory.control.engine_impl.middle_support import parse_middle_interval
+from jiuwen_memory.control.engine_impl.retrieval_pipelines import (
+    RetrievalPipelines,
+    build_retrieval_pipelines,
+)
 from jiuwen_memory.control.engine_impl.schema_update_support import (
     commit_schema_update,
     is_schema_update_candidate,
     prepare_schema_update,
 )
 from jiuwen_memory.control.engine_impl.sweep_support import run_sweep
+from jiuwen_memory.control.engine_impl.temporal_support import (
+    matches_delete_selector,
+    valid_at,
+)
+from jiuwen_memory.control.engine_impl.temporal_support import (
+    valid_sort_key as _valid_sort_key,
+)
 from jiuwen_memory.control.evolution.background import (
     BackgroundDependencies,
     start_hierarchy_derivation,
@@ -60,12 +70,19 @@ from jiuwen_memory.control.evolution.hierarchy_submission import (
     HierarchySubmissionDependencies,
     submit_hierarchy,
 )
+from jiuwen_memory.control.ingest_job import (
+    begin_ingest_write,
+    check_ingest_cancelled,
+    record_ingest_ids,
+    record_ingest_units,
+)
 from jiuwen_memory.control.jobs import JobFactory, JobFactoryProducer, JobType
 from jiuwen_memory.control.lifecycle import LifecycleManager, LifecycleProducer
 from jiuwen_memory.control.pipeline import MemoryPipeline, PipelineBinding, PipelineProducer
 from jiuwen_memory.control.policy import PolicyManager, PolicyProducer
 from jiuwen_memory.control.scheduler import Scheduler, SchedulerProducer
 from jiuwen_memory.control.types import (
+    BackgroundJobAdmission,
     BackgroundJobStartResult,
     BatchWriteItem,
     BatchWriteOutcome,
@@ -122,25 +139,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _valid_at(unit: MemoryUnit, as_of: datetime) -> bool:
-    valid_from = unit.temporal.t_valid
-    invalid_from = unit.temporal.t_invalid
-    has_non_positive_validity_window = (
-        valid_from is not None and invalid_from is not None and invalid_from <= valid_from
-    )
-    if has_non_positive_validity_window:
-        return as_of < invalid_from
-    if valid_from is not None and as_of < valid_from:
-        return False
-    if invalid_from is not None and as_of >= invalid_from:
-        return False
-    return True
-
-
-def _valid_sort_key(unit: MemoryUnit) -> datetime:
-    return unit.temporal.t_valid or datetime.min.replace(tzinfo=UTC)
-
-
 def _downweight_importance(unit: MemoryUnit) -> None:
     raw = unit.system_metadata.get("importance")
     try:
@@ -188,22 +186,6 @@ def _permission_context_from_unit(unit: MemoryUnit) -> PermissionContext:
     )
 
 
-def _matches_delete_selector(unit: MemoryUnit, selector: DeleteSelector) -> bool:
-    wanted_ids = set(selector.unit_ids)
-    wanted_tags = set(selector.tags)
-    if wanted_ids and unit.id not in wanted_ids:
-        return False
-    if wanted_tags and not wanted_tags.intersection(unit.tags):
-        return False
-    if selector.before is not None:
-        t_message = unit.temporal.t_message
-        if t_message is None or t_message >= selector.before:
-            return False
-    if selector.filters is not None and not matches_memory_unit(unit, selector.filters):
-        return False
-    return True
-
-
 def _expand_provenance_descendants(
     units: list[tuple[Scope, str, MemoryUnit]],
     seed_ids: set[_ScopedUnitId],
@@ -241,10 +223,12 @@ class InMemoryEngine(MemoryEngine):
         pipeline: MemoryPipeline | None = None,
         job_factory: JobFactory | None = None,
         policy: PolicyManager | None = None,
+        retrieval_pipelines: dict[str, Retriever] | None = None,
     ) -> None:
         self._ingestor = ingestor
         self._index = index_builder
         self._retriever = retriever
+        self._retrieval_pipelines = RetrievalPipelines(retriever, retrieval_pipelines)
         self._kv = kv
         self._scheduler = scheduler
         self._evolver = evolver
@@ -265,7 +249,7 @@ class InMemoryEngine(MemoryEngine):
         return self._kv
 
     def health(self) -> None:
-        return None
+        self._retrieval_pipelines.health()
 
     async def write(
         self,
@@ -330,7 +314,9 @@ class InMemoryEngine(MemoryEngine):
             occurred_at=occurred_at,
         )
         # 三条路径共用：Ingestor 规约。
+        check_ingest_cancelled()
         units = self._ingestor.ingest([payload])
+        check_ingest_cancelled()
         for unit in units:
             unit.tags = list(tags or [])
             if middle:  # 中期缓冲标记——MiddleToLongJob 据此过滤候选
@@ -349,11 +335,13 @@ class InMemoryEngine(MemoryEngine):
                 raise RuntimeError(
                     "Engine.write procedural=True requires an Evolver (装配未注入 evolver)"
                 )
+            begin_ingest_write()
             result = await asyncio.to_thread(
                 evolver.evolve, units, EvolveMode.EXTRACT
             )
             # 落盘产物优先取回传对象：归属判定改写派生单元的 scope 之后，按入参 scope
             # 回读真源会落空。回传为空时回落按 id 回读，兼容不回填该字段的 Evolver 实现。
+            record_ingest_ids(result.created_ids)
             derived = list(result.created_units) or [
                 self._load(scope, uid) for uid in result.created_ids
             ]
@@ -377,16 +365,17 @@ class InMemoryEngine(MemoryEngine):
                     evolver,
                     parse_middle_interval(middle_interval),
                 )
-            # 既有 infer=true 同步抽取路径，不动
             if evolver is None:
                 raise RuntimeError(
                     "Engine.write infer=True requires an Evolver (装配未注入 evolver)"
                 )
+            begin_ingest_write()
             result = await asyncio.to_thread(
                 evolver.evolve, units, EvolveMode.EXTRACT
             )
             # 落盘产物优先取回传对象：归属判定改写派生单元的 scope 之后，按入参 scope
             # 回读真源会落空。回传为空时回落按 id 回读，兼容不回填该字段的 Evolver 实现。
+            record_ingest_ids(result.created_ids)
             derived = list(result.created_units) or [
                 self._load(scope, uid) for uid in result.created_ids
             ]
@@ -402,10 +391,13 @@ class InMemoryEngine(MemoryEngine):
 
         # 默认路径（infer=false）：classifier 给原文打 tier+tags → 落 /memory/{id} + 建索引。
         # classifier 为 None 时跳过（tier 保持 EPISODIC 默认，向后兼容）。
+        check_ingest_cancelled()
         if classifier is not None:
             classifier.classify(units)
         # 记忆写入只经 IndexBuilder：交付 Storage + 建 hot 轻量索引由其统一编排。
+        begin_ingest_write()
         await asyncio.to_thread(index_builder.build, units)
+        record_ingest_units(units)
         return units
 
     # ---- 中期缓冲子路径 ----
@@ -449,7 +441,10 @@ class InMemoryEngine(MemoryEngine):
         for unit in units:
             unit.tier = MemoryTier.WORKING
             unit.system_metadata["middle"] = "true"
+        begin_ingest_write()
         await asyncio.to_thread(index_builder.build, units)
+        record_ingest_units(units)
+        check_ingest_cancelled()
 
         await self._scheduler.submit(job, channel=Channel.BACKGROUND)
         middle_metadata = {
@@ -509,11 +504,14 @@ class InMemoryEngine(MemoryEngine):
                     break
         return BatchWriteResult(outcomes=outcomes)
 
+    def retrieval_pipeline_names(self) -> tuple[str, ...]:
+        return self._retrieval_pipelines.names()
+
     async def recall(self, scope: Scope, query: RetrievalQuery) -> RetrievalResult:
         _ensure_local_scope(scope)
-        binding = self._recall_binding(query)
-        retriever = binding.retriever if binding is not None else self._retriever
-        return retriever.retrieve(scope, query)
+        self.validate_retrieval_pipeline(query.pipeline)
+        binding = self._recall_binding(query) if query.pipeline is None else None
+        return self._retrieval_pipelines.retrieve(scope, query, binding)
 
     async def list(
         self,
@@ -578,7 +576,7 @@ class InMemoryEngine(MemoryEngine):
         contexts: list[PermissionContext] = []
         for scope in scopes:
             for unit in self._list_units(scope):
-                if _matches_delete_selector(unit, selector):
+                if matches_delete_selector(unit, selector):
                     contexts.append(_permission_context_from_unit(unit))
         return contexts
 
@@ -593,7 +591,7 @@ class InMemoryEngine(MemoryEngine):
         for unit in self._version_family(scope, unit_id):
             if unit.lifecycle == LifecycleState.FORGOTTEN:
                 continue
-            if _valid_at(unit, as_of):
+            if valid_at(unit, as_of):
                 candidates.append(unit)
         if not candidates:
             logger.warning(
@@ -703,7 +701,7 @@ class InMemoryEngine(MemoryEngine):
         matches = [
             (scope, unit_id, unit)
             for scope, unit_id, unit in scanned
-            if _matches_delete_selector(unit, selector)
+            if matches_delete_selector(unit, selector)
         ]
         affected = [unit.id for _, _, unit in matches]
         if not affected:
@@ -847,12 +845,13 @@ class InMemoryEngine(MemoryEngine):
 
     async def start_background_jobs(
         self, scope: Scope, policy: PolicyManager,
+        *, admission: BackgroundJobAdmission | None = None,
     ) -> BackgroundJobStartResult:
         """将同源真源与 Evolver 注入后台任务，周期由 Scheduler 管理。"""
         _ensure_local_scope(scope)
         return await start_hierarchy_derivation(scope, policy, BackgroundDependencies(
             self._job_factory, self._scheduler, self._evolver, self._kv,
-        ))
+        ), admission=admission)
 
     async def admin_get(self, key: str) -> str:  # 由 API 层直达 PolicyManager
         raise NotImplementedError("admin 经 API 层直达 PolicyManager")
@@ -983,14 +982,17 @@ def _build(config):
         _ = _ji
         return JobFactoryProducer.build_named("default", ctx)
 
+    retriever = RetrieverProducer.dep(config, default="pipeline")
+    retrieval_pipelines = build_retrieval_pipelines(config)
     return InMemoryEngine(
         IngestorProducer.dep(config, default="simple"),
         IndexBuilderProducer.dep(config, "index_builder", default=ib_default),
-        RetrieverProducer.dep(config, default="pipeline"),
+        retriever,
         StoreManagerProducer.resolve(config).kv(resolve_name(config, "kv_store")),
         SchedulerProducer.dep(config, default="in_process"),
         EvolverProducer.dep(config, default="orchestrating"),
         LifecycleProducer.dep(config, default="kv"),
+        retrieval_pipelines=retrieval_pipelines,
         classifier=_opt_classifier(),
         pipeline=_opt_pipeline(),
         job_factory=_opt_job_factory(),

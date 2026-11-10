@@ -80,9 +80,9 @@ def configured_writer() -> MemoryAPIWriter:
         config["globals"][field] = _key_file(variable, config["globals"].get(field, ""))
     config["markdown_store"]["default"]["params"]["root"] = str(root / "documents")
     config["shadow_index"]["default"]["params"]["db_path"] = str(root / "shadow.db")
-    config["kv_store"] = {"default": {"target": "sqlite", "params": {
+    config["kv_store"]["default"] = {"target": "sqlite", "params": {
         "db_path": str(root / "sources.db"),
-    }}}
+    }}
     revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True,
     ).strip()

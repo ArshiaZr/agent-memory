@@ -33,7 +33,9 @@ MemoryUnit，导致多条路径断口：
 （`cloud_engine.py` 的 SUPERSEDE 分支）。唯独 AgentEngine 没接——`_build` 没注入
 domain_store，照搬了 InMemoryEngine 的 KV 直读 / lifecycle 直调。根因见记忆
 `doc-mode-supersede-kv-lifecycle-break`：`KVLifecycleManager` 的 supersede/transition/
-sweep 都从 KVStore 取 unit，文档模式下走它必 NotFoundError / 静默失效。
+sweep 都从 KVStore 取 unit，文档模式下走它必 NotFoundError / 静默失效。（该根因已由
+issue #261 根治——`KVLifecycleManager` 注入 `domain_store` 后按 `should_write_document()`
+文档分流，见「方案 A（后采纳）」。）
 
 ## 决策
 
@@ -50,7 +52,8 @@ sweep 都从 KVStore 取 unit，文档模式下走它必 NotFoundError / 静默�
 
 文档模式下 `KVLifecycleManager.supersede/transition` 从 KV 取 unit 必失败，根因是
 lifecycle 数据源与文档真源（shadow）不一致。本次选**engine 侧绕过**（对齐 CloudEngine
-SUPERSEDE 范式），不选 lifecycle 数据源根治（见「拒绝的方案」）：
+SUPERSEDE 范式），不选 lifecycle 数据源根治（见「拒绝的方案」）；该根治随后由
+issue #261 落地（见「方案 A（后采纳）」），engine 侧绕过仍保留：
 
 - **update SUPERSEDE**：`should_write_document()` 为真时，先 `restore_coords_from_md_filename`
   防 coords 丢失致新版落错 md 文件（见决策 3），再 `index.build([new])` 落新版，最后直接
@@ -59,6 +62,10 @@ SUPERSEDE 范式），不选 lifecycle 数据源根治（见「拒绝的方案�
 - **delete FORGET/ARCHIVE**：`should_write_document()` 为真时，直接
   `unit.lifecycle = target; index.update([...])` 落 shadow——不调 `lifecycle.transition`。
   DOWNWEIGHT 不改 lifecycle（上方已单独处理），不受影响。非文档模式维持 `lifecycle.transition`。
+  `index.update→domain.update` 文档分支按「md 可见性」删块（#261 方案 C，见
+  [F08](../../storage/F08-document-memory.md)「写入路径分流」update 行）：`FORGOTTEN`
+  物理删 md 块（遗忘=从文档消失），`ARCHIVED` 保留 md 块（转冷可回溯），`SUPERSEDED` 维持
+  已删；sweep FORGOTTEN（经 `lifecycle.transition` 回写真源 → `domain.update`）同口径统一删块。
 - 绕过不校验 `_ensure_transition_allowed`（对齐 CloudEngine SUPERSEDE 绕过不校验的简化风格）。
 
 ### 决策 3：提取 `restore_coords_from_md_filename` 到共用件
@@ -83,9 +90,15 @@ KV/DomainStore 双适配（`CandidateStore = KVStore | DomainStore`，`_is_kv_st
 本身不改（resolver 由 `submit_evolve` 经 `build_resolver` 装配并注入，EvolveJob 的 `self._kv`
 仅是 resolver=None 时的兜底，本路径不触达）。
 
+### 无路由部署的项目检索
+
+Agent 文档模式可直接通过 `system_metadata.project` 写入项目记忆。搜索时传入
+`Context.extensions["coords"]["project"]`，召回该项目和未指定项目的记忆。
+项目条件复用 F08 的影子索引过滤，显式 `filters` 可进一步收窄结果。
+
 ## 拒绝的方案
 
-### 方案 A（未选）：lifecycle 数据源根治——KVLifecycleManager 注入 DomainStore
+### 方案 A（当时未选，后由 issue #261 采纳）：lifecycle 数据源根治——KVLifecycleManager 注入 DomainStore
 
 让 `KVLifecycleManager.supersede/transition/sweep` 改从 DomainStore 取 unit，文档模式
 下自动分流到 shadow。**未选原因**：
@@ -97,6 +110,11 @@ KV/DomainStore 双适配（`CandidateStore = KVStore | DomainStore`，`_is_kv_st
    「engine 侧绕过」已是既定范式——AgentEngine 对齐它即可，无需另起 lifecycle 改造；
 3. sweep 仍读 KV 是共性问题（CloudEngine 同样未修），lifecycle 根治需连带处理 sweep
    数据源，本次明确列为遗留（见「已知遗留」），不在本次 scope 内。
+
+> **后记（issue #261）**：本方案已落地。`KVLifecycleManager` 注入 `domain_store` 后，
+> `transition`/`sweep`/`supersede` 改经 `_load_units`/`_write_units` 按
+> `should_write_document()` 文档分流——文档模式经 DomainStore（shadow）、非文档模式经
+> KV。见 `kv_lifecycle_manager.py` 模块 docstring 与「已知遗留」#1 的标注。
 
 ### 方案 B（未选）：AgentEngine 不持有 domain_store，read 时按 should_write_document 判别走 KV 或 shadow
 
@@ -124,9 +142,11 @@ DomainStore 读取」对 CloudEngine 已确立的范式），且会复制 Domain
 
 ## 已知遗留
 
-1. **`sweep_expired` 仍读 KV**：`lifecycle.sweep()` 纯计算从 KV 读全量，文档模式下失效。
+1. **`sweep_expired` 仍读 KV**（已由 issue #261 修复）：`lifecycle.sweep()` 纯计算从 KV 读全量，文档模式下失效。
    根治需 lifecycle.sweep 数据源改造（注入 DomainStore 或 engine 侧重写 sweep 计算）。
    CloudEngine 同样未修——列为跨 engine follow-up，不在本次 scope。
+   `KVLifecycleManager.sweep` 现按 `should_write_document()` 分流（文档模式走
+   `DomainStore.scopes()`/`list`，非文档模式走 KV `scopes()`/`list_units`）。
 2. **CloudEngine delete/sweep 共性遗留**：CloudEngine `delete`（非 SUPERSEDE 的 transition
    分支）/ `sweep` 也直调 lifecycle 未绕过，本次只修 AgentEngine。CloudEngine 共性问题
    在此记录为跨 engine follow-up。
@@ -134,3 +154,40 @@ DomainStore 读取」对 CloudEngine 已确立的范式），且会复制 Domain
    InMemoryEngine/CloudEngine 文档模式下受影响，本次不修。
 4. **非文档模式 lifecycle 未变**：非文档模式（KV 即真源）维持 `lifecycle.supersede/transition`
    直调——KV 持有 MemoryUnit，lifecycle 数据源与真源一致，无断点。本次绕过仅文档模式触发。
+
+## Swarm SDK 文档模式的视频写入
+
+Swarm 的 `JiuwenMemoryRail` 通过 Provider 的 schema 注册视频提交和状态查询工具。
+视频提交工具接受可选的 `project`。省略时，Rail 使用当前项目。无项目时写入根记忆目录。
+工具声明取自 SDK 装配结果。只有接入层声明支持本地结构化视频，且显式 `pipeline=video`
+路由绑定了能消费该结构的 Evolver 时才注册工具。缺少视频 profile 或绑定普通文本抽取器时，
+该路由不可用，提交工具不入队。
+Provider 使用已绑定的 Scope 和可信身份提交原生摄入任务，`AgentEngine` 把 URI 填入视频
+`RawPayload.uri`，并将 `pipeline=video` 交给配置的 metadata pipeline 选择视频 Evolver。
+视频路由使用 Scope 精确匹配的 `local_media_roots` 和配置好的 ASR、文本模型、视觉模型。
+内置视频 profile 使用 `video_memory` 抽取器、独立的 `message_store` 和 `dedup_extract: false`，
+保留片段与事件的引用关系。默认文本 profile 使用 `classifier: default`。两条流水线
+共用文档 IndexBuilder，视频片段和事件的文本描述及
+元数据分别进入 Markdown 和影子索引，显式 `agent_memory_search` 可检索视频记忆。
+
+Swarm 选择 AgentMemory 的 SDK 模式后，可直接使用 Provider 内置的视频算子和路由。
+部署环境用 `JIUWEN_MEMORY_VIDEO_ROOTS` 提供 JSON 数组，每项包含 `scope` 和 `root`。
+该变量为空时，Provider 默认只装配文本栈。启用内置视频时，使用 `ASR_API_BASE`、`ASR_MODEL_NAME`、
+`ASR_API_KEY` 配置语音转写服务，并用 `VIDEO_API_BASE`、`VIDEO_MODEL_NAME`、
+`VIDEO_API_KEY` 配置视觉服务。若需跨 SDK 实例或重启保留作业状态，可用
+`JIUWEN_MEMORY_VIDEO_JOB_DB` 指定专用 SQLite 文件。Swarm YAML 中现有的 SDK 显式覆盖仍可使用。
+SDK 通过 `config_path` 读取 YAML 或 JSON 时，设置 `JIUWEN_MEMORY_VIDEO_ROOTS` 后，
+Provider 也会先装配内置视频默认值，再应用文件里的显式配置。未设置该变量时，
+显式配置文件仍直接交给内核装配。
+
+视频工具通过公开 API 在入队前先做写入鉴权，再委托已装配的规约器验证本地 URI 和扩展名。
+`local_media_roots` 可按标准配置规则由实例参数覆盖全局配置。后台暂存文件时仍独立校验。
+同一 Scope、项目和规范化 URI 重复提交时沿用原生摄入任务的重试与去重规则。原地替换文件后，
+使用不同 URI 发起新导入。若旧作业可能部分写入，先核对旧作业及其产物。状态工具以 MemoryUnit ID
+回报写入结果。
+SDK 宿主可能重建 Provider。把 `ingest_job.default.params.kv_store` 指向独立的 SQLite KV
+可以在重建后查询任务状态。共享该任务库的同进程 SDK 实例会识别仍在执行的任务，避免误判
+中断并重复提交。取消请求由持有执行句柄的同进程控制器执行。协调器绑定到任务库的资源身份，
+SQLite 按规范化文件路径共享，独立数据库及快照即使含有相同任务 ID 也相互隔离。其他 KV
+默认仅在同一存储实例上共享进程内协调。切换任务库的路由后端或 SQLite 路径前，应停止接收新任务，
+等待已提交任务结束，再切换并重新装配运行时。该配置仅持久化作业元数据，任务仍由原进程执行。

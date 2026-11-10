@@ -44,3 +44,10 @@ oracle，导入器不会凭空补齐缺失背景，因此完整评测必须显�
 默认 factory 将原文 KV 改为持久 SQLite 并关闭 watcher，明确披露实验装配差异。
 旧 LongMemEval runner 保留为独立诊断，不能绕过新门禁后声称符合完整协议。
 原生有限 recent source 缓存不变；journal 保留全量输入但不是自动可检索的源归档。
+
+## 上游同步适配（2026-11-10）
+
+原生 agent profile 上游新增可选的具名 KV 存储。摄入 composition root 只覆盖
+kv_store.default，不再整体替换命名空间，保留其他具名依赖。回归检查覆盖可选
+store 仍存在、模型/凭证变化指纹，以及 native 提炼/文档存储重启后的门禁召回。
+Python 3.13.18 下相关单测与集成测试通过；模型输出为确定性夹具，不调用付费模型。

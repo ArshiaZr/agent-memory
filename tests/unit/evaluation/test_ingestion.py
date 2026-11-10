@@ -335,6 +335,16 @@ def test_configured_factory_pins_native_profile_and_ignores_only_credential_rota
     monkeypatch.delenv("MEMORY_INGEST_LLM_KEY_FILE", raising=False)
     monkeypatch.delenv("MEMORY_INGEST_EMBED_KEY_FILE", raising=False)
     monkeypatch.setattr("evaluation.ingestion.runtime.assemble_runtime", assemble)
+    from evaluation.ingestion import runtime as ingestion_runtime
+
+    original_profile = ingestion_runtime.agent_default_config
+
+    def profile_with_optional_store():
+        config = original_profile()
+        config["kv_store"]["optional_source"] = "memory"
+        return config
+
+    monkeypatch.setattr(ingestion_runtime, "agent_default_config", profile_with_optional_store)
     first = configured_writer()
     monkeypatch.setenv("JIUWEN_MEMORY_API_KEY", "fixture-second-credential")
     rotated = configured_writer()
@@ -345,6 +355,7 @@ def test_configured_factory_pins_native_profile_and_ignores_only_credential_rota
     assert configs[0]["engine"]["default"]["target"] == "agent"
     assert configs[0]["extractor"]["default"]["target"] == "agent_llm"
     assert configs[0]["kv_store"]["default"]["target"] == "sqlite"
+    assert configs[0]["kv_store"]["optional_source"] == "memory"
     assert configs[0]["globals"]["watch_document"] is False
     assert first.security_provider().auth.actor == Scope(org="local", user="developer")
     for writer in (first, rotated, changed):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # pylint: disable=protected-access  # 测试直取内部装配与状态以断言接线行为
 import datetime
+import logging
 import os
 
 import pytest
@@ -188,7 +189,9 @@ def test_render_block_falls_back_to_empty_title_when_no_team() -> None:
 
 def test_write_persists_blocks_and_backfills_md_filename(tmp_path) -> None:
     store = _store(tmp_path)
-    unit = _unit("u1", "hello", {MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"}})
+    unit = _unit(
+        "u1", "hello", {MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"}}
+    )
 
     store.write(SCOPE, [unit])
 
@@ -242,10 +245,24 @@ def test_replace_content_replaces_matching_block(tmp_path) -> None:
 
 def test_replace_content_returns_false_when_no_match(tmp_path) -> None:
     store = _store(tmp_path)
-    unit = _unit("u1", "hello", {MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"}})
+    unit = _unit(
+        "u1", "hello", {MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"}}
+    )
     store.write(SCOPE, [unit])
 
     assert store.replace_content(SCOPE, "memory/p1/MEMORY.md", "not there", "x") is False
+
+
+@pytest.mark.parametrize("new_title", [None, "", "杭州\n居民"])
+def test_replace_content_handles_optional_title(tmp_path, new_title) -> None:
+    store = _store(tmp_path)
+    unit = _unit("u1", "old", {MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "上海居民"})
+    store.write(SCOPE, [unit])
+
+    assert store.replace_content(SCOPE, "USER.md", "old", "new", new_title=new_title)
+
+    title = "上海居民" if new_title is None else " ".join(new_title.split())
+    assert (tmp_path / "USER.md").read_text(encoding="utf-8") == f"# {title}\nnew\n\n"
 
 
 def test_replace_content_returns_false_when_file_missing(tmp_path) -> None:
@@ -282,7 +299,9 @@ def test_remove_content_returns_false_when_no_match(tmp_path) -> None:
     store = _store(tmp_path)
     store.write(
         SCOPE,
-        [_unit("u1", "hello", {MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"}})],
+        [_unit("u1", "hello", {
+            MEMORY_CLASS_KEY: "long_term_memory", COORDS_KEY: {"project": "p1"},
+        })],
     )
 
     assert store.remove_content(SCOPE, "memory/p1/MEMORY.md", "missing") is False
@@ -509,6 +528,123 @@ def test_edit_content_replaces_unique_substring(tmp_path) -> None:
     assert "hello world" not in text, f"old content still present: {text!r}"
 
 
+@pytest.mark.parametrize(
+    "memory_class,basename",
+    [("user_profile", "USER.md"), ("long_term_memory", "MEMORY.md")],
+)
+def test_edit_content_refreshes_matching_fact_in_heading(
+    tmp_path, memory_class, basename,
+) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "用户居住在上海。", {
+        MEMORY_CLASS_KEY: memory_class,
+        MD_TITLE_KEY: "居住地上海",
+        COORDS_KEY: {"project": ""},
+    })])
+
+    store.edit_content(
+        SCOPE, basename, "用户居住在上海。", "用户居住在杭州。", project="",
+    )
+
+    assert store.read_content(SCOPE, basename, project="") == (
+        "# 居住地杭州\n用户居住在杭州。\n\n"
+    )
+
+
+def test_edit_content_preserves_explicitly_edited_heading(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "用户居住在上海。", {
+        MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "居住地上海",
+    })])
+
+    store.edit_content(
+        SCOPE, "USER.md",
+        "# 居住地上海\n用户居住在上海。",
+        "# 常住城市杭州\n用户居住在杭州。",
+    )
+
+    assert store.read_content(SCOPE, "USER.md") == "# 常住城市杭州\n用户居住在杭州。\n\n"
+
+
+def test_edit_content_uses_unique_context_for_ambiguous_minimal_diff(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "用户居住在上海。", {
+        MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "海边工作，常住上海",
+    })])
+
+    store.edit_content(SCOPE, "USER.md", "用户居住在上海。", "用户居住在上饶。")
+
+    assert store.read_content(SCOPE, "USER.md") == (
+        "# 海边工作，常住上饶\n用户居住在上饶。\n\n"
+    )
+
+
+def test_edit_content_preserves_generic_heading_without_old_fact(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "用户居住在上海。", {
+        MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "居住地",
+    })])
+
+    store.edit_content(SCOPE, "USER.md", "用户居住在上海。", "用户居住在杭州。")
+
+    assert store.read_content(SCOPE, "USER.md") == (
+        "# 居住地\n用户居住在杭州。\n\n"
+    )
+
+
+def test_replace_content_falls_back_when_heading_drifted(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "上海", {
+        MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "手改标题",
+    })])
+    assert store.replace_content(
+        SCOPE, "USER.md", "上海", "杭州", old_title="原始标题", new_title="居住地杭州",
+    )
+    assert store.read_content(SCOPE, "USER.md") == "# 居住地杭州\n杭州\n\n"
+
+
+def test_cross_block_edit_does_not_infer_titles_from_block_positions(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [
+        _unit("u1", "上海", {MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "上海"}),
+        _unit("u2", "杭州", {MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "上海"}),
+    ])
+    old = store.read_content(SCOPE, "USER.md")
+    new = "# 上海\n杭州\n\n# 上海\n上海\n\n"
+    store.edit_content(SCOPE, "USER.md", old, new)
+    assert store.read_content(SCOPE, "USER.md") == new
+
+
+def test_replace_content_ignores_bare_body_when_counting_fallback_candidates(tmp_path) -> None:
+    store = _store(tmp_path)
+    store.write(SCOPE, [_unit("u1", "上海", {
+        MEMORY_CLASS_KEY: "user_profile", MD_TITLE_KEY: "手改标题",
+    })])
+    with (tmp_path / "USER.md").open("a", encoding="utf-8") as stream:
+        stream.write("上海\n\n")
+
+    assert store.replace_content(
+        SCOPE, "USER.md", "上海", "杭州", old_title="原始标题", new_title="居住地杭州",
+    )
+    assert store.read_content(SCOPE, "USER.md") == "# 居住地杭州\n杭州\n\n上海\n\n"
+
+
+def test_edit_content_preserves_daily_team_heading(tmp_path) -> None:
+    store = _store(tmp_path)
+    unit = _unit("u1", "用户居住在上海。", {
+        MEMORY_CLASS_KEY: "daily_memory",
+        COORDS_KEY: {"team": "研发组", "project": ""},
+    })
+    store.write(SCOPE, [unit])
+    basename = unit.system_metadata[MD_FILENAME_KEY].rsplit("/", 1)[-1]
+
+    store.edit_content(SCOPE, basename, "上海", "杭州", project="")
+
+    assert store.read_content(SCOPE, basename, project="") == (
+        "# 研发组\n用户居住在杭州。\n\n"
+    )
+
+
 def test_edit_content_accepts_cross_block_text(tmp_path) -> None:
     """old_text 任意文本（跨块均可），不强制对齐块边界。"""
     store = _store(tmp_path)
@@ -572,3 +708,61 @@ def test_edit_content_resolves_project_subdir(tmp_path) -> None:
     store.edit_content(SCOPE, "MEMORY.md", "project content", "edited", project="p1")
     text = store.read_content(SCOPE, "MEMORY.md", project="p1")
     assert "edited" in text, f"project-scoped edit failed: {text!r}"
+
+
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize(
+    "memory_class", ["long_term_memory", "daily_memory", "private-client@example.test"]
+)
+def test_title_logs_redact_pii_without_changing_document(
+    tmp_path, caplog, monkeypatch, restore, memory_class,
+):
+    """Both normal writes and compensation must keep PII out of INFO logs."""
+    from jiuwen_memory.storage.markdown_impl.local_markdown_store import logger
+
+    title = "Alice alice@example.test 13800138000"
+    team = "Bob bob@example.test 13900139000"
+    unit = _unit(
+        "technical-id",
+        "original body",
+        {
+            MEMORY_CLASS_KEY: memory_class,
+            MD_TITLE_KEY: title,
+            COORDS_KEY: {"team": team},
+        },
+    )
+    store = _store(tmp_path)
+    if restore:
+        unit.system_metadata[MD_FILENAME_KEY] = "restored.md"
+    # Assembly stops propagation at agent_memory; capture at the emitting logger and
+    # also avoid duplicate records when this file is run without earlier assembly.
+    logger.addHandler(caplog.handler)
+    try:
+        with monkeypatch.context() as logging_state:
+            logging_state.setattr(logger, "propagate", False)
+            with caplog.at_level(logging.INFO, logger=logger.name):
+                if restore:
+                    store.restore_blocks(SCOPE, [unit])
+                else:
+                    store.write(SCOPE, [unit])
+    finally:
+        logger.removeHandler(caplog.handler)
+    trace = [record.getMessage() for record in caplog.records if "[trace/md]" in record.msg]
+    assert len(trace) == 1, "render must still emit its diagnostic event"
+    assert all(
+        value not in trace[0]
+        for value in (title, team, memory_class, "alice@", "bob@", "13800138000", "13900139000")
+    ), "PII must not appear in rendered logs"
+    assert "memory_class=*" in trace[0] and "technica" in trace[0], (
+        "technical diagnostics must remain visible"
+    )
+    document = (tmp_path / unit.system_metadata[MD_FILENAME_KEY]).read_text(encoding="utf-8")
+    expected_title = team if memory_class == "daily_memory" else title
+    assert document == f"# {expected_title}\noriginal body\n\n", "redaction must affect logs only"
+    assert unit.system_metadata[MEMORY_CLASS_KEY] == memory_class, (
+        "log redaction must not normalize or overwrite business categories"
+    )
+    assert unit.system_metadata[MD_TITLE_KEY] == title, "business metadata must remain intact"
+    assert unit.system_metadata[COORDS_KEY]["team"] == team, (
+        "business coordinates must remain intact"
+    )

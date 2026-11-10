@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import fields, replace
 from math import isfinite
 from typing import Any, NamedTuple
@@ -41,6 +42,7 @@ from jiuwen_memory.common.type_def import (
     iter_clauses,
 )
 from jiuwen_memory.construction import EvolveMode
+from jiuwen_memory.construction.router import SpaceNaming
 from jiuwen_memory.control.policy import PolicyManager
 from jiuwen_memory.control.types import (
     DeleteSelector,
@@ -264,6 +266,48 @@ def _space_level_scope(scope: Scope) -> Scope:
     return Scope(org=scope.org, space=scope.space)
 
 
+def _md_memory_class(md_filename: str) -> str:
+    """md 文件名 → memory_class（对齐 ``MarkdownStore.resolve_md_path`` 分流，F08 §3）。
+
+    USER.md → user_profile；MEMORY.md → long_term_memory；其余（daily 日期文件等）
+    → daily_memory。与 ``_md_path.class_from_md_path`` 不同——后者收完整相对路径、
+    未知兜底 long_term_memory；此处收 ``read_md_file`` 的 basename，其余即 daily（与
+    ``resolve_md_path`` 同口径）。
+    """
+    base = md_filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if base == "USER.md":
+        return "user_profile"
+    if base == "MEMORY.md":
+        return "long_term_memory"
+    return "daily_memory"
+
+
+def space_scope_for_md_read(
+    naming: SpaceNaming,
+    scope: Scope,
+    md_filename: str,
+    coords: Mapping[str, str],
+) -> Scope:
+    """``read_md_file`` 反查前把 raw scope 折算成空间级 scope（org+space）。
+
+    路由启用时写入侧把落盘 scope 归一为 ``Scope(org, space)``（主体维恒空，space 是
+    该 md 文件对应 memory_class 的 space_template 经 coords 渲染）。read_md_file 反查
+    （``find_unit_ids_by_content_hash`` 5 段等值）拿调用方 raw scope（org+user）去匹配，
+    space/user 两段结构错位 → 静默返空（read_md_file 与 routing 互操作缝隙）。
+
+    ``coords`` 须为已折算坐标：调用方在传入前经
+    ``common.security.principal.kernel_coords`` 以身份覆盖内核三项（user/agent/session），
+    否则 ``u_{user}`` 这类内核坐标模板渲染不出（业务 coords 无 user 键）。
+
+    这里把读回侧 scope 折算到与落盘同一形态（org+space，主体维不参与数据面等值），
+    读写两侧对称。折算不出（模板空 / 坐标缺项）退回 raw scope——放宽方向，不阻断读取。
+    """
+    space = naming.render(_md_memory_class(md_filename), coords)
+    if not space:
+        return scope
+    return Scope(org=scope.org, space=space)
+
+
 def _parse_coords(value: object) -> dict[str, str]:
     """归属坐标的运行期判型。
 
@@ -285,8 +329,8 @@ def _pop_coords(options: dict[str, Any], *, enabled: bool) -> dict[str, str] | N
     移除不可省略：``options`` 随 parser 透传给自定义检索模块，留下会让坐标以一个未声明
     的字段出现在该模块的入参里。与 ``EXT_MAX_TOKENS`` 同一处置。
 
-    ``enabled`` 为假即整体不介入：未装配判定表的部署里该键不产生收窄谓词，取出它只会让
-    自定义检索模块少收到一个调用方明明传了的字段。本特性在那种部署里应当完全不可达。
+    ``enabled`` 为假时保留坐标供自定义检索模块使用。无路由文档模式的 project 收窄
+    由 search 单独处理。
     """
     if not enabled or COORDS_KEY not in options:
         return None

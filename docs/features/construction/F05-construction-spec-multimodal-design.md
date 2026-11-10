@@ -4,7 +4,7 @@
 
 | 项 | 值 |
 |---|---|
-| 日期 | 2026-09-05 |
+| 日期 | 2026-11-09 |
 | 影响范围 | `jiuwen_memory_entry/core/`、`jiuwen_memory/control/`、`jiuwen_memory/ingest/`、`jiuwen_memory/construction/`、`jiuwen_memory/retrieval/` |
 | 状态 | **已落地**（视频记忆写入、异步任务管理及多通道检索） |
 
@@ -169,6 +169,31 @@ return json.dumps({
 流水线使用任务级临时目录处理音频、帧和模型输入，任务结束后自动删除；不保存
 `short_term.json`、`medium_term.json` 等中间结果文件。
 
+**包络不参与接入层预切分**（issue #294）：`VideoNormalizer.structured_modalities()` 声明 `VIDEO`
+为结构化中间产物，`SimpleIngestor` 对命中的模态跳过大文本预切分（`max_unit_chars` 缺省 8000，
+按段落边界切、单段超长硬切）。视频包络是紧凑单行
+JSON，没有段落边界，稍长的视频就会在第 8000 字符处被硬切成两个非法 JSON 片段，
+`VideoMemoryExtractor` 对每片 `json.loads` 全部失败、抽取零产出。视频的切分已在流水线
+里按时间窗口与事件边界完成，包络只是把切好的 clips/events 打包交给抽取器拆解，不需要也
+不能再按字符数切。
+
+决策与取舍：
+
+| 方案 | 结论 |
+|---|---|
+| 规约器自声明 `structured_modalities()`（采用） | `Normalizer` 基类加非抽象方法、缺省空集，既有与第三方实现零改动；`VideoNormalizer` 在产出包络的同一个类里声明 VIDEO，`RoutingNormalizer` 按分派汇总。默认行为回到「一律预切分」，自定义 IMAGE / AUDIO 规约器的纯文本投影保护不变；接入层不再维护模态白名单，没有两处知识需要同步 |
+| 接入层按模态白名单（text / code / document 才切） | 评审两轮指出同一问题：IMAGE / AUDIO 的 caption / OCR / ASR 投影同为纯文本，白名单把它们误归为不切分，且白名单与 passthrough 声明的模态是两处重复知识。此方案曾作为中间版本落地，被自声明替代 |
+| 接入层按模态黑名单（仅排除 VIDEO） | 忘记登记新的结构化规约器时包络被切碎、抽取零产出且无兜底；相比之下白名单/自声明忘记登记只是单个大 unit 走构建层 `prompt_guard` 分批，可恢复 |
+| 抽取器按 `_part`/`_parts` 把片段拼回 | 硬切点被加了段落分隔符，拼回不保证等于原文；且让每个消费方理解切分器内部约定，耦合方向反了 |
+| 按内容是否为 JSON 判断 | 判错方向：用户以文本提交的大段 JSON 会逃过预切分，重新触发整段进 LLM 的同步写入卡死 |
+| `max_unit_chars=0` 关闭预切分 | 文本的同步写入卡死问题回归 |
+
+验证基线：`tests/unit/common/test_normalizer_capabilities.py`（passthrough 缺省空集、video 声明 VIDEO、routing 按分派汇总）、
+`tests/unit/ingest/test_simple_ingestor.py`（声明结构化的超限包络保持单 unit、未声明的自定义 IMAGE 规约器超限输出仍切分、code 仍切分）与
+`tests/unit/construction/test_video_memory_extractor.py`（超过 8000 字符的包络经 SimpleIngestor +
+VideoMemoryExtractor 产出 4 CLM + 2 ELM）。已知遗留：视频源单元仍会作为「最近原文」写入
+`/messages/` 并参与去重召回，巨型包络对后续文本抽取的语境价值有限，另行处理。
+
 ### 4. 多层级记忆构建
 
 **代码路径**：
@@ -202,12 +227,16 @@ result = self._dedup_batch(extracted)
 **代码路径**：原生 `KVStore`、`IndexBuilder` 及其当前配置实现。
 
 **职责**：最终 CLM/ELM 使用 `/memory/<MemoryUnit.id>` 保存，并由原生全文和向量
-IndexBuilder 建立索引。系统不新增多模态 Store，原始视频不复制，只在
-`segments[].assets` 中保留 URI。
+IndexBuilder 建立索引。系统不新增多模态 Store，原始视频不持久化；读取前生成任务
+私有副本供流水线处理，结束后清理，`segments[].assets` 保留原始 URI。
 
-服务配置文件为 `examples/config_multimodal.yml`，配置完成后可按以下方式启动：
+服务配置文件为 `examples/config_multimodal.yml`。示例导入根在装配期必须已存在，先按
+默认 dev 身份创建目录，并将待处理媒体放入其中；修改 root 时同步调整建目录命令。
+以下为 Linux 本地启动示例，Windows 应在 YAML 中使用已存在的本机绝对目录。
+完成模型服务配置后启动：
 
 ```bash
+mkdir -p /tmp/agent-memory-imports/local/developer
 ./scripts/run-server.sh --auth-mode dev --host 127.0.0.1 --port 8002 examples/config_multimodal.yml
 ```
 
@@ -315,3 +344,13 @@ CLM `content` 已是视觉片段描述，ELM `content` 已是事件摘要，当�
 - 图片、音频和 Dreaming 闲时扫描尚未实现。
 - 查询驱动的快速处理尚未实现。对于网页视频链接或上传后立即提问的场景，可先使用
   VLM 做粗粒度处理，同时在后台完成完整记忆构建。
+
+
+### 本地视频导入部署前提
+
+使用本地视频前需在视频 Normalizer 的 `params.local_media_roots` 配置完整 Scope
+对应的导入目录，并预先创建目录；启用归属判定时匹配归一后的 org/space 落点，
+不能沿用 dev 示例的 user 绑定。未配置时明确拒绝，不再允许读取服务进程可访问的
+任意路径。`temp_root` 仅用于临时处理文件。接口参数、原资产引用及输出投影保持原样；
+配置语义见 [S08](../../specs/S08-config.md#视频本地媒体目录配置)，安全设计见
+[F04](../common/F04-security-interfaces-and-encryption.md#本地视频源文件准入)。

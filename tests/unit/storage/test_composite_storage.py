@@ -17,6 +17,7 @@ from jiuwen_memory.common.tokenizer.tokenizer_impl.whitespace_tokenizer import W
 from jiuwen_memory.common.type_def import (
     COORDS_KEY,
     MD_FILENAME_KEY,
+    MD_TITLE_KEY,
     MEMORY_CLASS_KEY,
     MemoryUnit,
     RetrievalPipeline,
@@ -439,6 +440,77 @@ def test_document_mode_update_replaces_md_block(tmp_path) -> None:
     assert "old content" not in md
 
 
+@pytest.mark.parametrize("title_only", [False, True])
+@pytest.mark.parametrize("memory_class", ["user_profile", "long_term_memory"])
+def test_document_mode_update_syncs_title(tmp_path, title_only, memory_class) -> None:
+    scope = Scope(org="org", user="user")
+    storage = _doc_storage(tmp_path)
+    unit = _doc_unit(scope, "u1", "居住在上海")
+    unit.system_metadata.update({MEMORY_CLASS_KEY: memory_class, MD_TITLE_KEY: "上海居民"})
+    other = _doc_unit(scope, "u2", "喜欢游泳")
+    other.system_metadata.update({MEMORY_CLASS_KEY: memory_class, MD_TITLE_KEY: "爱好"})
+    storage.add(scope, [unit, other])
+
+    (updated,) = storage.get(scope, ["u1"])
+    updated.system_metadata[MD_TITLE_KEY] = "杭州居民"
+    if not title_only:
+        updated.segments[0].content = "居住在杭州"
+    storage.update(scope, [updated])
+
+    content = "居住在上海" if title_only else "居住在杭州"
+    md_path = tmp_path / unit.system_metadata[MD_FILENAME_KEY]
+    assert md_path.read_text(encoding="utf-8") == (
+        f"# 杭州居民\n{content}\n\n# 爱好\n喜欢游泳\n\n"
+    )
+    (stored,) = storage.get(scope, ["u1"])
+    assert stored.system_metadata[MD_TITLE_KEY] == "杭州居民"
+    assert stored.segments[0].content == content
+
+
+def test_document_mode_update_keeps_daily_team_title(tmp_path) -> None:
+    scope = Scope(org="org", user="user")
+    storage = _doc_storage(tmp_path)
+    unit = _doc_unit(scope, "u1", "old content")
+    unit.system_metadata.update({
+        MEMORY_CLASS_KEY: "daily_memory", MD_TITLE_KEY: "old title",
+        COORDS_KEY: {"project": "p1", "team": "infra"},
+    })
+    storage.add(scope, [unit])
+    (updated,) = storage.get(scope, ["u1"])
+    updated.system_metadata[MD_TITLE_KEY] = "new title"
+    updated.segments[0].content = "new content"
+    storage.update(scope, [updated])
+
+    md_path = tmp_path / unit.system_metadata[MD_FILENAME_KEY]
+    assert md_path.read_text(encoding="utf-8") == "# infra\nnew content\n\n"
+
+
+def test_document_mode_title_update_matches_old_heading_and_body(tmp_path) -> None:
+    scope = Scope(org="org", user="user")
+    storage = _doc_storage(tmp_path)
+    first = _doc_unit(scope, "u1", "same content")
+    second = _doc_unit(scope, "u2", "same content")
+    first.system_metadata[MD_TITLE_KEY] = "first title"
+    second.system_metadata[MD_TITLE_KEY] = "second title"
+    storage.add(scope, [first, second])
+    (updated,) = storage.get(scope, ["u2"])
+    updated.system_metadata[MD_TITLE_KEY] = "updated\n  title"
+    storage.update(scope, [updated])
+
+    md_path = tmp_path / second.system_metadata[MD_FILENAME_KEY]
+    assert md_path.read_text(encoding="utf-8") == (
+        "# first title\nsame content\n\n# updated title\nsame content\n\n"
+    )
+    assert storage.get(scope, ["u1"])[0].system_metadata[MD_TITLE_KEY] == "first title"
+    assert storage.get(scope, ["u2"])[0].system_metadata[MD_TITLE_KEY] == "updated title"
+    (updated,) = storage.get(scope, ["u2"])
+    updated.system_metadata[MD_TITLE_KEY] = "final title"
+    storage.update(scope, [updated])
+    assert md_path.read_text(encoding="utf-8") == (
+        "# first title\nsame content\n\n# final title\nsame content\n\n"
+    )
+
+
 def test_document_mode_update_finds_md_via_old_when_new_unit_lacks_md_filename(tmp_path) -> None:
     """new unit 不带 MD_FILENAME_KEY 时，OVERWRITE 分支须从 old.system_metadata 取 md_filename，
     否则 if md_filename 守卫失败 → md.replace_content 被静默跳过 → md 与 shadow 漂移。
@@ -452,9 +524,9 @@ def test_document_mode_update_finds_md_via_old_when_new_unit_lacks_md_filename(t
     calls: list[tuple] = []
     orig = LocalMarkdownStore.replace_content
 
-    def spy(self, scope_arg, md_filename, old_content, new_content):
+    def spy(self, scope_arg, md_filename, old_content, new_content, **kwargs):
         calls.append((md_filename, old_content, new_content))
-        return orig(self, scope_arg, md_filename, old_content, new_content)
+        return orig(self, scope_arg, md_filename, old_content, new_content, **kwargs)
 
     # 读回 old（自带 MD_FILENAME_KEY），构造 new unit：同 id、改 content，但清掉 MD_FILENAME_KEY
     (old,) = storage.get(scope, ["u1"])
@@ -566,7 +638,8 @@ def test_document_mode_delete_missing_id_is_noop(tmp_path) -> None:
 def test_document_mode_soft_delete_exits_retrieval_via_lifecycle(tmp_path) -> None:
     """SOFT 删除契约：文档模式下 delete(SOFT) 本身是 no-op，检索退出由
     「先 transition（update FORWARD_ONLY 同步 lifecycle 投影列）再 remove(SOFT)」
-    实现——lifecycle 谓词下推后 FTS 不召回，本体与 md 块保留。
+    实现——lifecycle 谓词下推后 FTS 不召回，本体保留（get 可读）。md 块按 FORGOTTEN
+    隐藏态语义物理删除（#261 方案 C）。
 
     锁定三重排除机制的第①②环：谓词下推 + 投影列同步。若谓词下推
     （_compile_system_filters）或 update 投影列覆写被改坏，本测试失败。
@@ -580,17 +653,18 @@ def test_document_mode_soft_delete_exits_retrieval_via_lifecycle(tmp_path) -> No
     storage.add(scope, [_doc_unit(scope, "u1", "retired content")])
 
     # 遗忘流第①步：transition = 改 lifecycle + update(FORWARD_ONLY)（对齐
-    # KVLifecycleManager.transition / InMemoryEngine.delete 的调用序）。
+    # KVLifecycleManager.transition / InMemoryEngine.delete 的调用序）。FORGOTTEN 是
+    # 隐藏态，update 文档分支按 content 不变走 remove_content 物理删 md 块。
     (unit,) = storage.get(scope, ["u1"])
     unit.lifecycle = LifecycleState.FORGOTTEN
     storage.update(scope, [unit], mode=IndexWriteMode.FORWARD_ONLY)
-    # 遗忘流第②步：remove(SOFT)——文档模式 no-op，不删本体不删 md 块。
+    # 遗忘流第②步：remove(SOFT)——文档模式 no-op，不删本体。
     storage.delete(scope, ["u1"], mode=IndexRemoveMode.SOFT)
 
-    # 本体保留（SOFT 契约）：get 可读，md 块仍在。
+    # 本体保留（SOFT 契约）：get 可读；md 块已物理删除（遗忘=从文档消失）。
     assert storage.get(scope, ["u1"]) != []
     md = (tmp_path / "memory" / "p1" / "MEMORY.md").read_text(encoding="utf-8")
-    assert "retired content" in md
+    assert "retired content" not in md
 
     # 检索退出（FORGOTTEN 不召回）：filters = project 谓词（否则批 1 落 default
     # 不含 p1，断言空洞）+ lifecycle 谓词（对齐 build_system_filters 当前态产出
@@ -607,6 +681,25 @@ def test_document_mode_soft_delete_exits_retrieval_via_lifecycle(tmp_path) -> No
         scope, TextQuery(text="retired content", top_k=10, filters=filters)
     )
     assert not any(h.id == "u1" for h in hits)
+
+
+def test_document_mode_archived_keeps_md_block(tmp_path) -> None:
+    """ARCHIVED 保留 md 块（转冷可回溯）——#261 方案 C：仅 SUPERSEDED/FORGOTTEN 隐藏态
+    物理删块，ARCHIVED 是可回溯的冷态，md 块必须留在文档里供 as_of/回溯读取。
+    """
+    from jiuwen_memory.common.type_def.memory import LifecycleState
+
+    scope = Scope(org="org", user="user")
+    storage = _doc_storage(tmp_path)
+    storage.add(scope, [_doc_unit(scope, "u1", "cold content")])
+
+    (unit,) = storage.get(scope, ["u1"])
+    unit.lifecycle = LifecycleState.ARCHIVED
+    storage.update(scope, [unit])
+
+    assert storage.get(scope, ["u1"]) != []
+    md = (tmp_path / "memory" / "p1" / "MEMORY.md").read_text(encoding="utf-8")
+    assert "cold content" in md
 
 
 def test_document_mode_soft_delete_bare_call_keeps_recall(tmp_path) -> None:
@@ -675,7 +768,9 @@ def test_document_mode_update_compensates_shadow_on_md_failure(tmp_path, monkeyp
     """update：md.replace_content 抛错 → shadow.update_units([old]) 还原，原异常抛出。"""
     scope = Scope(org="org", user="user")
     storage = _doc_storage(tmp_path)
-    storage.add(scope, [_doc_unit(scope, "u1", "old content")])
+    unit = _doc_unit(scope, "u1", "old content")
+    unit.system_metadata[MD_TITLE_KEY] = "old title"
+    storage.add(scope, [unit])
 
     shadow = storage._raw_shadow_index()
     md = storage._raw_markdown()
@@ -697,6 +792,7 @@ def test_document_mode_update_compensates_shadow_on_md_failure(tmp_path, monkeyp
 
     (old,) = storage.get(scope, ["u1"])
     old.segments[0].content = "new content"
+    old.system_metadata[MD_TITLE_KEY] = "new title"
     with pytest.raises(RuntimeError, match="md replace failed"):
         storage.update(scope, [old])
 
@@ -704,9 +800,11 @@ def test_document_mode_update_compensates_shadow_on_md_failure(tmp_path, monkeyp
     assert update_calls == [["u1"], ["u1"]]
     # shadow 还原成 old content（补偿生效）。
     assert storage.get(scope, ["u1"])[0].segments[0].content == "old content"
+    assert storage.get(scope, ["u1"])[0].system_metadata[MD_TITLE_KEY] == "old title"
     # md 仍是 old content（replace_content 抛错未改）。
     md_text = (tmp_path / "memory" / "p1" / "MEMORY.md").read_text(encoding="utf-8")
     assert "old content" in md_text
+    assert "# old title\n" in md_text
 
 
 def test_document_mode_delete_compensates_shadow_on_md_failure(tmp_path, monkeypatch) -> None:

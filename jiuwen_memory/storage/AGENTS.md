@@ -22,6 +22,7 @@
 | `base.py` | BaseStore 基类：所有存储后端的自描述契约（store_type / health） |
 | `types.py` | 存储层数据类型：`IndexWriteMode`/`IndexRemoveMode` 写删语义枚举、KVMemoryListResult/VectorRecord/Document/Node/Edge/FusionRecord/FileStat 等 |
 | `_schema_property_index.py` | Schema Entity → Property MemoryUnit ID 的 KV 派生反向索引；以 Scope watermark 作为全量回填提交标记，membership/pointer 支持幂等更新与硬删；canonical identity 按 `schema_entity_id` → `schema_entity_key` → `type::name` 解析且要求非空 `schema_property_name` |
+| `migration.py` | 受保护插件的可选明文记忆维护契约，插件声明枚举、物理身份和原子转换，不依赖实现私有状态 |
 | `kv.py` | KVStore 接口：键值存储，统一 CRUD + MemoryUnit 列表查询 + 范围枚举；共享读 helper 三件——`load_memory_unit(raw, scope, key)` 解码隔离（坏字节记 warning 后返 `None`），`load_units(kv, scope, unit_ids)` 点读（缺失省略/保序/不去重/零过滤），`list_units(kv, scope, **list kwargs) -> (items, count)` 列表读（`kv.list` + 反序列化，过滤/计数/分页语义由 `KVStore.list` 契约承担） |
 | `vector.py` | VectorStore 接口：向量存储，统一 CRUD + ANN 检索 |
 | `graph.py` | GraphStore 接口：属性图存储，节点与边统一 CRUD + 邻域遍历 |
@@ -30,7 +31,7 @@
 | `fs.py` | FSStore 接口：文件系统存储（原始负载/二进制资产）；可选 object_id 能力为加密提供稳定对象标识 |
 | `encryption.py` | PR1-1 的 StoreManager 装配保护：全部具名 KV/FS 包装、公开依赖契约去重、可配置 Producer 包装与缓存回填；公共 manager 保护清单准入检查 |
 | `entity_store.py` | EntityStore 端口契约（**StorageCapability 第七席位 ENTITY**）：以 `space_id` routing + `EntityStoreFilters` 中非空的 `actor_id` / `assistant_id` / `session_id` 隔离的实体反向索引；`space_id: str` 作显式第一入参——BaseStore「scope 第一入参」的**唯一例外**，授权由 `_AuthorizedEntityStoreProxy` 专门适配 |
-| `_support.py` | 后端实现共用：异常归一（`wrap_backend`）、scope 派生（`scope_dims`/`scope_segments`）、SSL 配置读取（`read_ssl_config`）；`SslConfig` 与 scheme 校验复用 `common._support` |
+| `_support.py` | 后端实现共用：异常归一（`wrap_backend`）、scope 派生（`scope_dims`/`scope_segments`）、SSL 配置读取（`read_ssl_config`）、已选后端依赖预加载（`preload_backend`）；`SslConfig` 与 scheme 校验复用 `common._support` |
 | `_pg.py` | PostgreSQL 后端共享基础：asyncpg 惰性连接池（专职事件循环线程桥接同步调用）、schema 工具与 FilterExpr SQL 编译；`dsn` 支持 ConfigSource 晚绑定 |
 | `kv_impl/` | KVStore 实现目录（memory / sqlite / redis / encrypted / postgres）及共用的 `memory_list.py` 兼容逻辑；连接型后端支持 `kv_store.*` 晚绑定 |
 | `vector_impl/` | VectorStore 实现目录（memory / milvus / pgvector）；`uri`/`dsn` 晚绑定 |
@@ -58,6 +59,8 @@
 `exists` / `scan` / `scopes`；fs 提供 `stat`。
 
 ## 行为铁律
+
+- **显式维护能力**：内置 KV 通过公开 migration_identity、原子 compare_exchange 和声明过的有界 migration_records 迭代支持受控维护，不回退全量 scan。内存 KV 的读写、枚举和 CAS 在实例方法内持有同一把锁，过期清理也在锁内；SQLite 的 insert/CAS 在取得实例锁和数据库写锁后检查状态与到期时间，冲突插入不覆盖。EncryptedKV 的扫描/迁移能力不用于正常读取，保留到期语义且不复活扫描后消失的记录。缺少可靠枚举/CAS 时明确不支持。
 
 - **统一静态加密准入**：`StoreManagerProducer.resolve` 在开关开启时验证完整
   encryption_inventory，清单与公开端口须为同一对象。Composite manager 通过 Producer
@@ -171,6 +174,22 @@
 
 ## 本地约束
 
+配置工厂选中 ES 全文、ES 实体、Milvus 向量或 `milvus_graph` 融合后，在同步装配期经 `preload_backend`
+加载 `elasticsearch` / `pymilvus`，记录开始、完成与耗时；仅对依赖导入期间的普通
+`Exception` 归一为 `BackendError` 并保留原始异常链，`KeyboardInterrupt` / `SystemExit` /
+取消等 `BaseException` 原样透传。客户端连接及索引/集合创建仍在首次使用时执行，直接构造 Store 仍保留
+惰性导入；融合后端的图依赖也保持惰性加载。离线后端不预加载上述依赖，
+ES 实体未配置 hosts/endpoint 时先返回 None。
+融合工厂先校验必填参数和正维度，再预加载 `pymilvus`，最后构造 Store 创建工作目录，
+依赖加载失败时不得留下新目录。
+正维度规则统一由 `vector_impl/milvus_vector.py` 的 `require_positive_dim` 实现，
+向量构造函数与融合工厂共用；融合工厂的错误使用 `milvus_graph fusion` 标明后端。
+
+- `LocalMarkdownStore` 的正常写入与补偿恢复共享标题渲染；标题、`md_title`、团队坐标与 `memory_class`（含未知非空值）必须通过 `redact_for_log` 记录，日志脱敏不修改实际 Markdown、正文或元数据。
+- 文档更新同步写回显式提供的 `md_title`（含仅标题变化和空标题）；缺失时保留文件原标题，daily 文件保留团队标题。标题和正文在同次文件写入及失败补偿中处理。
+- 文件编辑工具仅改 USER.md/MEMORY.md 正文时，同步替换标题中对应的旧事实片段并更新影子索引标题；显式改过的标题与 daily 团队标题不自动改写。
+- 标题漂移时仅在正文唯一的情况下回退匹配；跨块编辑不按位置推断事实标题。文件编辑的标题同步使用块位置与旧标题区分重复正文，解析标题仅去掉一个 Markdown 标题前缀。
+
 1. 所有 Store 必须实现 `store_type()` 和 `health()`（继承自 `BaseStore`）。
 2. 实现通过 `@XxxProducer.register("name")` 自注册。
 3. 检索型 Store 的 `get` 批量查询时，缺失的 id 从结果中省略（不抛异常）。
@@ -256,11 +275,12 @@
     CloudEngine 的记忆 get/list/scopes 及其权限事实由 DomainStore 真源提供；文档写入经
 DocumentIndexBuilder 委托 DomainStore，ShadowDedup 读取 shadow。文档模式下二者的
     `update` SUPERSEDE / `delete` FORGET·ARCHIVE 在 engine 侧绕过 `KVLifecycleManager` 直接
-    落 shadow（lifecycle 数据源仍是 KV，文档模式真源在 shadow 必失败；见
+    落 shadow（engine 侧绕过是 F09 决策 2 既定范式；`KVLifecycleManager` 的
+    `supersede`/`transition`/`sweep` 已注入 `domain_store` 文档分流，见
     [F09](../../docs/features/control/F09-agent-engine-doc-mode-read.md)）。
-    `InMemoryEngine` 仍直连 KV（非文档模式、KV 即真源）。`LifecycleManager` 仍直连 KV——
-    文档模式下 engine 侧绕过它而非改造其数据源（sweep 共性遗留见 F09）。Schema/middle/lifecycle
-    的 KV 耦合不因文档开关自动消失，不能承诺所有组合均已适配。DomainStore 消费方
+    `InMemoryEngine` 仍直连 KV（非文档模式、KV 即真源）。`LifecycleManager` 已注入
+    `domain_store` 文档分流（#261 覆盖 `transition`/`sweep`，本次补 `supersede`）。
+    Schema/middle 的 KV 耦合不因文档开关自动消失，不能承诺所有组合均已适配。DomainStore 消费方
     有检索路径（`PipelineRetriever`）、一体化写路径（`UnifiedIndexBuilder`）与 Engine 读取路径
     （`CloudEngine`/`AgentEngine`）。
 
@@ -281,3 +301,11 @@ SQLite 下推 `NOT(t_valid > T)` 为 `t_valid IS NULL OR t_valid <= T`，在 rec
 
 CompositeDomainStore 与 KeywordRecaller 的真源候选检查传入完整 ParsedQuery；
 不得仅传时间字段，否则会遗漏结构过滤。API 负责鉴权，数据面消费已授权的 Scope 与谓词。
+
+
+### 正排 KV 真源领域读取
+
+StoreManager.domain_store_for_kv(name) 定义可选领域读契约，默认抛不支持错误，不依赖具体实现。
+CompositeStoreManager 实现该方法，返回显式绑定受管 KV 的领域门面，用于正排写入前复核。
+该门面仍执行 memory_unit 授权并通过受管 KV 代理读数，不借用默认数据面的真源端口、
+文档模式或召回配置，不注册或替换 manager 的具名数据面。

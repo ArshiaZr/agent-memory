@@ -5,10 +5,43 @@
 | 项 | 值 |
 |---|---|
 | 关联模块 | jiuwen_memory/construction/ |
-| 最近一次修订日期 | 2026-10-23 |
+| 最近一次修订日期 | 2026-11-10 |
 | 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md |
 | 归属判定算子 | `Router` 的契约与决策见 [F07-collective-memory-design.md](../features/control/F07-collective-memory-design.md) |
 | 关联特性文档 | docs/features/F01-system-spec-design.md, docs/features/construction/F01-construction-spec-design.md, docs/features/construction/F02-dynamic-extraction-consolidation.md, docs/features/construction/F03-extraction-layer-integrity.md, docs/features/construction/F04-cc-memory-compat.md, docs/features/construction/F05-construction-spec-multimodal-design.md, docs/features/construction/F06-unified-index-builder.md, docs/features/construction/F07-memory-write-entry.md, docs/features/construction/F08-entity-schema-extension.md, docs/features/common/F01-memory-layer.md, docs/features/common/F03-scope-space-isolation.md, docs/features/common/F08-memory-tree.md, docs/features/retrieval/F03-metadata-filtering.md |
+
+## 乱序陈述的修改型决策契约
+
+- UPDATE/SUPERSEDE 应返回并指向当前判定可见的 `existing_id`。`OrchestratingEvolver`
+  保留单命中兼容：仅一个可见命中且 ID 缺省时使用该命中；多命中缺省或 ID 越界时转
+  ADD，不得默认修改最高相似记录。`DynamicEvolver` 自定义 prompt 仍要求显式 ID。
+  模型改选目标后，执行时使用该目标自身的召回分数。
+- `t_message` 仅表示陈述先后，`t_event` 表示事件时间，`[t_valid, t_invalid)` 表示已有有效期；
+  三者不得互相兜底。只有双方有时区且不在未来的消息时间才可排序；同刻或缺失时保守 ADD。
+- UPDATE 成功合并较新候选时，正文与 `t_message` 一并持久化，后者推进为该候选的消息时间
+  （归一到 UTC），用于后续陈述排序；`t_event` 与已有有效期不随之改变。
+- 旧 SUPERSEDE 候选落盘并退出当前态，existing 不变；旧 UPDATE 候选独立保留，禁止旧值合并覆盖。
+  不相交或非法有效期不自动截断，不从消息时间回填 t_valid，不重建缺乏事实生效依据的业务历史。
+- 反向失效的候选同时计入 created_ids/created_units 和 superseded_ids；后者表示本次被标为
+  SUPERSEDED 的记录，可能就是刚创建的候选。不新增 expired_ids 或生命周期枚举。
+- 未来 valid-time 保留真实边界；旧现任在截止点前仍 ACTIVE，新版在起点前由有效期过滤。
+  SUPERSEDE 已回写旧记录的有效期但仍保持 ACTIVE 时，将旧记录计入 updated_ids；
+  已转为 SUPERSEDED 时计入 superseded_ids。
+- 修改前复核目标真源；批内新写入记录参与后续候选重判。该复核不构成跨请求原子事务。
+  批内后继关系按原目标与后继各自的完整 Scope + ID 记录，允许去重范围内跨 session/agent
+  的显式替代；不得仅凭 supersedes 的裸 ID 推断跨 Scope 关系。返回对象快照仍按完整
+  Scope + ID 替换，不将去重范围等同于持久化记录身份。
+  目标复核和候选重试点读必须使用与 IndexBuilder 写入相同的 DomainStore；具名数据面
+  不能回落默认数据面，原文 message_store 的 KV 也不能替代记忆真源。
+  标准 Evolver Producer 支持 `params.domain_store` 指定 manager 的具名数据面，供未声明读能力的
+  自定义 IndexBuilder 使用；若与 builder 已声明的读接口不是同一实例，则拒绝装配，避免猜测同源。
+  直接构造 Evolver 也执行相同绑定校验，不允许显式注入绕过；已声明读接口时应省略
+  domain_store，或直接注入 builder 返回的同一接口实例。相同 KV 不代表门面的编码、文档模式
+  和授权语义等价，因此不据此放宽校验。
+- 抽取日期依据逐来源确定：显式 observation_date、aware t_message 的当地日期、当前 UTC 日期。
+  不允许整批借用首条消息的日期。调用方不传消息时间时，不承诺自动解决陈述乱序。
+  自定义 prompts.extract 应按各来源旁的 observation_date 解析相对时间，不能假定
+  首个 observation_date 是整批共享日期；来源 ID 与日期一一对应。
 
 ## Metadata 派生与索引契约
 
@@ -73,6 +106,11 @@ IndexBuilder 以带命名空的逻辑路径投影两类字段。
 7. **scope 原生隔离**：构建索引时将来源 `MemoryUnit.scope` 作为 Store 方法的显式
    入参下推；`VectorRecord` / `Document` / `Node` 等记录结构不混入 scope 字段。
 8. **去重召回与判定分离**：去重召回（用哪个索引）由 `Dedup` 接口承担，判定（ADD/UPDATE/SUPERSEDE/NOOP）与落盘由 Evolver 实现承担——`OrchestratingEvolver._evolve_extract`（legacy，`_dedup_batch` 判定+落盘耦合）或 `DynamicEvolver._evolve_extract`（dynamic，consolidate 只判定、落盘延后到 reflect 之后）。装配按 `vector_enabled` 选 `VectorDedup`/`KeywordDedup`。
+   LLM 判定为 UPDATE/SUPERSEDE 时应返回 `existing_id`，且该 ID 必须来自同一候选
+   本次 `Dedup.recall` 的命中集合；最高相似项只用于排序，不能代替模型选择的语义目标。
+   `OrchestratingEvolver` 仅对单命中且 ID 缺省保留兼容，多命中缺省或 ID 非法时降级
+   为 ADD；`DynamicEvolver` 仍要求显式 ID。
+   `dedup_high_similarity` 默认值为 `1.0`；只有精确重复且 `should_direct_noop` 判断无实质差异时才允许跳过 LLM。
 9. **构建层不依赖 control**：`DynamicEvolver`/`OrchestratingEvolver` 的 SUPERSEDE 与 FORGET 经 `IndexBuilder` 完成，不经 `LifecycleManager`。
 10. **Dedup 与 IndexBuilder 共享底层 Store**：去重召回检索的是已索引内容，`Dedup` 实现取的 `VectorStore`/`FulltextStore` 必须与 IndexBuilder 写入的是同一实例（按字段名缓存命中）。
 11. **派生 metadata 键保持类型稳定**：当前 Classifier 只更新
@@ -284,8 +322,8 @@ Schema Evolver 对非 procedural 写入采用 Source-first，并将属性候选�
 按 `layer_annotator_threshold`（默认 512）筛选：仅对 `len(content) > threshold` 的 unit
 标注，短 content 留空。LLM 批量结果必须以合法、唯一的 ID 完整覆盖输入；重复、越界或
 遗漏 ID 时整批不写。每条结果应满足 `0 < len(L0) < len(L1) < len(L2)`，仅长度不合法的
-条目单独跳过，其余条目在结构校验完成后写入。超过 `CONTENT_MAX_UNIT_CHARS` 的 unit 
-不截断，按段落边界分片逐片生成 L0/L1：**全部片段都有效才合并写回**，任一片无效则该 
+条目单独跳过，其余条目在结构校验完成后写入。超过 `CONTENT_MAX_UNIT_CHARS` 的 unit
+不截断，按段落边界分片逐片生成 L0/L1：**全部片段都有效才合并写回**，任一片无效则该
 unit 整体放弃本次标注——保留原有 layers（未标注为空）并 warning 上报，不提交残缺的
 整篇摘要。Evolver 在 EXTRACT/CONSOLIDATE 抽取
 （升华）后、去重落盘前调用。
@@ -331,6 +369,7 @@ unit 整体放弃本次标注——保留原有 layers（未标注为空）并 w
 
 | 方法 | 签名 | 语义 |
 |------|------|------|
+| `read_domain_store` | `() -> DomainStore \| None` | 可选能力：返回写入所绑定的领域真源读接口；包装器透传。未声明能力时返回 None，Evolver 必须显式配置或注入同源读接口，否则拒绝装配或写入；禁止回落默认数据面 |
 | `build` | `(units, *, mode: IndexWriteMode = ALL) -> None` | 建立已启用的各形式索引；`RETRIEVAL_ONLY` 表示记忆本体已存在、只补建检索索引，`FORWARD_ONLY` 表示只交付本体 |
 | `update` | `(units, *, mode: IndexWriteMode = ALL) -> None` | 更新各形式索引；`FORWARD_ONLY` 表示只回写记忆本体、检索索引不动，`RETRIEVAL_ONLY` 表示只刷新检索索引 |
 | `remove` | `(units, *, mode: IndexRemoveMode = HARD) -> None` | 按每个 MemoryUnit 自带 Scope 删除索引（幂等）；`SOFT` 为软删除——只移出检索索引（search/recall 不再召回），记忆本体保留、get/list 仍可读；`HARD` 物理删除本体与全部索引 |
@@ -434,6 +473,7 @@ class HierarchyComposeRequest:
     leaves: list[MemoryUnit]
     options: HierarchyComposeOptions
     existing_parents: list[MemoryUnit] = field(default_factory=list)
+    incremental: HierarchyIncrementalContext | None = None
 
 @dataclass
 class HierarchyRepair:
@@ -449,6 +489,8 @@ class HierarchyComposeResult:
     replaced_parent_ids: list[str] = field(default_factory=list)
     repair_required: list[HierarchyRepair] = field(default_factory=list)
     complete: bool = True
+    deferred_child_count: int = 0
+    pending_before: datetime | None = None
 ```
 
 `HierarchyComposer.build(request)` 为首次构建，拒绝旧父边；
@@ -517,6 +559,7 @@ class EvolveResult:
     updated_ids: list[str] = field(default_factory=list)
     superseded_ids: list[str] = field(default_factory=list)
     forgotten_ids: list[str] = field(default_factory=list)
+    created_units: list[MemoryUnit] = field(default_factory=list)
     hierarchy_result: HierarchyComposeResult | None = None
 ```
 
@@ -564,6 +607,12 @@ Construction 层的 LLM 实现统一使用 `max_attempts` 与 `retry_backoff_ms`
 
 去重召回，由 Evolver 实现（`OrchestratingEvolver._dedup_batch` / `DynamicEvolver._consolidate_step`）及 infer 上下文收集调用。召回 + 阈值过滤 + 加载 + 聚合取 max 全在实现内完成；判定与落盘动作归调用方（evolver）。
 
+LLM 的修改型判定（UPDATE/SUPERSEDE）必须绑定具体已有单元：判定结果同时携带
+`existing_id`，执行层按该 ID 在当前候选的召回命中中解析目标和对应相似度。
+`OrchestratingEvolver` 仅对单命中且 ID 缺省使用该唯一命中；多命中缺省、非法或不属于
+该候选命中集合的 ID 一律降级为 ADD，不得回退到最高相似项执行修改。
+`DynamicEvolver` 的修改型判定仍要求显式 ID。
+
 | 方法 | 签名 | 语义 |
 |------|------|------|
 | `recall` | `(candidate: MemoryUnit) -> list[tuple[MemoryUnit, float]]` | 对候选召回已有相似记忆，返回 (unit, score) 列表（按 score 降序）；已完成过滤自身、过滤非 ACTIVE、按 unit 聚合取 max、按 min_similarity 过滤低分。空列表 → 调用方判 ADD |
@@ -587,7 +636,7 @@ Construction 层的 LLM 实现统一使用 `max_attempts` 与 `retry_backoff_ms`
 | `tier` | MemoryTier | 认知角色（working/core/episodic/semantic/procedural/archival） |
 | `segments` | list[Segment] | 内容段列表（多段内容投影，每段含 content+assets+source） |
 | `source_ref` | str | 来源引用（RawPayload id / 会话 id 等，可溯源） |
-| `temporal` | Temporal | 时间：t_event / t_ingest / t_valid / t_invalid |
+| `temporal` | Temporal | 时间：t_event / t_ingest / t_valid / t_invalid / t_message |
 | `provenance` | list[str] | 演进血缘（多→一）：由哪些 unit 抽取/升华/合并而来 |
 | `supersedes` | str | 版本链（一→一）：本版取代的上一版 id（空=首版） |
 | `tags` | list[str] | 标签（检索前置过滤用） |
@@ -690,6 +739,13 @@ Event 不设时间跨度窗口。会话、上下文、结束信号、语义判�
 
 
 ### TIME 单层增量构建与封口
+
+内部增量上下文可携带 `write_admission: Callable[[Scope], None] | None`。
+周期任务必须从 API 注入该回调，Composer 不实现授权或接收身份；直接内部纯构建请求
+仍可不带回调。准备完成后，先对实际父/子目标 Scope 执行准入检查；随后每批
+IndexBuilder 真源及索引写入前再次检查。准备阶段拒绝以 HierarchyPreparationError
+报告本层未写入；写入期间拒绝按现有部分失败协议返回完成项和 repair_required。
+不承诺空间状态改变与底层写入间的原子性，已发生的部分写入不能宣称回滚。
 
 `HierarchyComposeRequest.incremental` 是可选的内部 `HierarchyIncrementalContext`，
 包含 `settle_at`（本轮时间）、`ready_before`（下层待定最早起点）与

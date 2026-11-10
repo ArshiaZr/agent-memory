@@ -2,7 +2,7 @@
 """MemoryEngine — 记忆引擎（接口层 §9 各语义的编排中枢）。
 
 记忆接口层 ``jiuwen_memory/api`` 是本引擎的薄封装：只做参数装配后逐方法委托到
-这里，跨层编排全部在引擎内完成。**引擎方法一律为异步协程**（数据面与
+这里，跨层编排全部在引擎内完成。**引擎数据操作为异步协程**（能力查询、无 I/O 参数校验除外；数据面与
 管理面均触及 IO——存储、向量库、LLM/embedding），事件循环形态（HTTP/
 MCP）可直接 await 非阻塞调用，CLI/脚本等同步形态由接口层 ``jiuwen_memory/api``
 自行桥接（如 ``asyncio.run``）：
@@ -22,7 +22,9 @@ from __future__ import annotations
 from abc import abstractmethod
 from datetime import datetime
 
+from jiuwen_memory.common.errors import ValidationError
 from jiuwen_memory.common.factory.factory import Factory
+from jiuwen_memory.common.normalizer.base import LocalMediaPreflight
 from jiuwen_memory.common.type_def import (
     CandidateSource,
     Context,
@@ -35,7 +37,7 @@ from jiuwen_memory.common.type_def import (
 from jiuwen_memory.construction import EvolveMode
 from jiuwen_memory.construction.source_update import SourceUpdatePlan
 from jiuwen_memory.control.policy import PolicyManager
-from jiuwen_memory.control.types import BackgroundJobStartResult
+from jiuwen_memory.control.types import BackgroundJobAdmission, BackgroundJobStartResult
 from jiuwen_memory.retrieval import RetrievalQuery, RetrievalResult
 from jiuwen_memory.storage.kv import KVStore
 
@@ -75,6 +77,10 @@ class MemoryEngine(ControlOperator):
         只读用途，不作为写入通道。
         """
 
+    def video_ingest_preflight(self) -> LocalMediaPreflight | None:
+        """Return local-file admission for the explicit video write route, when available."""
+        return None
+
     def candidate_scopes(self) -> list[Scope]:
         """返回演进候选数据面中已有记忆的作用域。"""
         return self.kv.scopes()
@@ -97,6 +103,22 @@ class MemoryEngine(ControlOperator):
         提交 background 通道异步执行，不在本调用内等待。接口层的同步
         write 由其自行桥接本协程。
         """
+
+    def retrieval_pipeline_names(self) -> tuple[str, ...]:
+        """可选检索 pipeline 公开名；旧插件默认不声明选择能力。"""
+        return ()
+
+    def validate_retrieval_pipeline(self, name: str | None) -> None:
+        """纯校验，在 API 扇出前和直接 recall 入口共用；不触发检索。"""
+        if name is None:
+            return
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError("retrieval_pipeline must be a non-empty string or None")
+        names = self.retrieval_pipeline_names()
+        if name not in names:
+            raise ValidationError(
+                f"unknown retrieval_pipeline {name!r}; available: {', '.join(names)}"
+            )
 
     @abstractmethod
     async def recall(self, scope: Scope, query: RetrievalQuery) -> RetrievalResult:
@@ -246,8 +268,9 @@ class MemoryEngine(ControlOperator):
 
     async def start_background_jobs(
         self, scope: Scope, policy: PolicyManager,
+        *, admission: BackgroundJobAdmission | None = None,
     ) -> BackgroundJobStartResult:
-        """注册已鉴权 home 的后台任务；不在控制层重新判权。"""
+        """注册后台任务并透传 API 准入回调；控制层不实现判权。"""
         raise NotImplementedError("当前 Engine 未实现自动建树")
 
     @abstractmethod

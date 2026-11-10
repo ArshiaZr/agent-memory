@@ -5,7 +5,7 @@
 
 | 项    | 值                                                                                                                                                                                                       |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 日期   | 2026-08-09                                                                                                                                                                                              |
+| 日期   | 2026-10-29                                                                                                                                                                                              |
 | 影响范围 | `jiuwen_memory/config/`、`jiuwen_memory/api/memory_api_impl/assembly.py`、消费配置的 LLM/Embedder/Reranker/Store/PromptRegistry/检索开关路径；`docs/specs/S08-config.md`、`docs/design/architecture.md` §13、`docs/specs/S02-memory-api.md`；Storage 实例动态配置见 F02 |
 | 测试基线 | 见文末「验证」；完整 key 清单见决策 2.1                                                                                                                                                                                |
 | Refs | 借鉴密钥侧 `KeySource` 抽象模式（外部可插来源 + 默认 local/YAML）                                                                                                                                                          |
@@ -139,6 +139,36 @@
 | `reranker.model`    | 已接线（`api` dialect）      | `APIReranker` 每次 `rerank`/`health`   |
 | `reranker.api_key`  | 已接线                     | 同上                                   |
 | `reranker.base_url` | 已接线                     | 同上                                   |
+
+
+**具名实例 key 隔离（2026-10-29 修复）**
+
+同一命名空间存在多个 LLM 实例时，端点键必须由实例身份决定：
+
+| YAML 实例 | ConfigSource key |
+| --- | --- |
+| `llm.default` | `llm.model` / `llm.api_key` / `llm.base_url` |
+| `llm.alt` | `llm.alt.model` / `llm.alt.api_key` / `llm.alt.base_url` |
+
+装配投影与读取使用同一个实例命名空间规则。OpenAI / DashScope builder 从 `config.name`
+自动推导；匿名内联实例与 `default` 使用 `llm.*`。显式 `config_namespace` 原值覆盖自动推导，
+用于选择共享或自定义 key 族，不是非 default 实例避开 default 投影的必需参数。
+
+`config_namespace` 只从实例 `params` 读取，不从 `globals` 回退；必须是非空字符串，值会先
+`strip()` 再作为有效命名空间。空白、`null` 或其他非字符串在装配期抛 `ValidationError`。
+装配投影和 builder 都通过同一解析函数使用有效命名空间：未显式覆盖时投影到
+`llm.<instance>.*`，覆盖后则把该实例端点参数投影到自定义命名空间，避免读写键不一致。
+
+拒绝以下替代方案：要求所有用户手工配置 `config_namespace`；同时投影长字段和短字段两套
+别名；让 fallback 永远优先于 ConfigSource。前者保留静默失效入口，中者延长错误契约，后者
+会破坏运行时改值。
+
+本次只对已迁移的 `llm` 启用实例作用域投影。Embedder / Reranker / ASR / Store 等消费
+builder 尚未接入实例命名空间推导，继续保留原投影，避免生成只写不读的配置键；后续迁移时
+须同时修改投影 allow-list、消费 builder 与测试。
+
+`default` 是主实例保留名，只有 `llm.default` 映射到共享 `llm.*`；把主实例命名为其他名称时
+会按其真实名称使用 `llm.<name>.*`，不为旧名称或 `default` 建立兼容别名。
 
 
 **改选用（次选，异质多实例）**
@@ -341,7 +371,17 @@ Store / Storage 切换后旧库数据不自动迁移。`memory` 等无连接串�
 
 
 
+### 默认 AgentEngine 的依赖继承（GitCode #299）
+
+在内核装配阶段保留省略的依赖引用，让只换引擎或只覆写部分参数的配置继续使用具名组件。
+未显式配置的索引随文档和向量开关选择，关闭向量时保留真源读写并使用关键词去重。
+
 ## 拒绝的方案
+
+### 拒绝对所有实例深合并参数
+
+通用深合并会改变其他组件的实例覆盖语义，也可能把旧实现专用参数带到新实现。
+默认 AgentEngine 的依赖继承限于内核装配。
 
 
 
@@ -396,7 +436,16 @@ PolicyManager 是少量已知键的策略表，不适合 prompt 长文本、连�
 
 实现基线：
 
+- GitCode #299 回归覆盖引擎简写、部分参数、显式空参数、具名依赖回退告警、文档模式共享索引、
+  关闭向量的索引与去重，以及纯数据合并保持整体替换（`test_build_kernel_config.py`、
+  `test_document_security_lifecycle.py`）。
 - OpenAI Embedder/LLM、API Reranker：同实例改 `*.model`/`*.api_key`/`*.base_url` 后，下次调用使用新值（`tests/unit/config/test_late_binding.py`）。
+- 多 LLM 实例：同时存在 `llm.default` 与 `llm.alt` 且 alt 未配置 `config_namespace` 时，
+  alt 的 model/API Key/base URL 仍来自自身；OpenAI 与 DashScope 均由同一用例参数化覆盖。
+  投影侧锁定 `llm.alt.model` 等短字段键且不再生成 `llm.alt.llm_model`；显式
+  `config_namespace=custom.llm` 时投影和读取都使用 `custom.llm.*`；`globals.config_namespace`
+  不参与推导，空白或 `null` 实例值在装配期失败（`tests/unit/config/test_config_source.py`、
+  `tests/unit/config/test_late_binding.py`）。
 - Redis 等连接型 Store：改 `kv_store.url` / host 四元组 / `dsn` / `db_path` / `uri` / `hosts` / `working_dir` / `root` 后惰性客户端按新值重建（`tests/unit/config/test_store_late_binding.py`）。
 - 默认 `YamlDefaultsConfigSource` 零配置可跑；`PromptRegistry` 优先 `fetch`。
 - `*.active` 对未预装实例抛 `ValidationError`（次选路径；Store 见 `tests/unit/config/test_store_routing.py`）。
@@ -405,6 +454,9 @@ PolicyManager 是少量已知键的策略表，不适合 prompt 长文本、连�
 
 
 ## 已知遗留
+
+- 默认 AgentEngine 仍支持通过显式空参数选择匿名缺省。绕过已有具名默认依赖时，
+  装配日志会列出回退路径和所选实现。
 
 - 与 `PolicyManager` 键集合是否长期合并/迁移，待策略面整理时另开特性。
 - 多租户「每 space 一份 ConfigSource」还是「全局一份 + key 带 space 前缀」待产品隔离模型确定后补充（demo 采用进程级适配器 + 请求 `bind_identity` + 远程按身份取值）。

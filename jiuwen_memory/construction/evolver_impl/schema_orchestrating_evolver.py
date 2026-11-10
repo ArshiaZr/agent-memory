@@ -16,7 +16,7 @@ from jiuwen_memory.common.embedder.base import EmbedderProducer
 from jiuwen_memory.common.errors import ValidationError
 from jiuwen_memory.common.llm.base import LLM, LlmProducer
 from jiuwen_memory.common.log import get_logger
-from jiuwen_memory.common.type_def import MemoryUnit
+from jiuwen_memory.common.type_def import MemoryUnit, Modality
 from jiuwen_memory.config.document_flag import resolve_index_builder_default
 from jiuwen_memory.construction.abstractor import Abstractor, AbstractorProducer
 from jiuwen_memory.construction.associator import Associator, AssociatorProducer
@@ -26,6 +26,7 @@ from jiuwen_memory.construction.evolver import EvolveResult, EvolverProducer
 from jiuwen_memory.construction.evolver_impl.orchestrating_evolver import (
     OrchestratingEvolver,
     _resolve_message_store,
+    _resolve_read_domain,
 )
 from jiuwen_memory.construction.evolver_impl.schema_entity_registry import SchemaEntityRegistry
 from jiuwen_memory.construction.evolver_impl.schema_entity_resolver import SchemaEntityResolver
@@ -45,6 +46,7 @@ from jiuwen_memory.construction.source_update import (
     SourceUpdatePlan,
     SourceUpdateSupport,
 )
+from jiuwen_memory.storage.domain_store import DomainStore
 from jiuwen_memory.storage.kv import KVStore, load_units
 from jiuwen_memory.storage.store_manager import (
     StoreManager,
@@ -74,9 +76,10 @@ class SchemaOrchestratingEvolver(OrchestratingEvolver, SourceUpdateSupport):
         schema_property_merge_planner: SchemaPropertyMergePlanner | None = None,
         *,
         hierarchy_composer: HierarchyComposer | None = None,
+        domain_store: DomainStore | None = None,
         kv_name: str = "default",
         dedup_medium_similarity: float = 0.7,
-        dedup_high_similarity: float = 0.9,
+        dedup_high_similarity: float = 1.0,
     ) -> None:
         super().__init__(
             extractor=extractor,
@@ -89,6 +92,7 @@ class SchemaOrchestratingEvolver(OrchestratingEvolver, SourceUpdateSupport):
             llm=llm,
             layer_annotator=layer_annotator,
             hierarchy_composer=hierarchy_composer,
+            domain_store=domain_store,
             dedup_medium_similarity=dedup_medium_similarity,
             dedup_high_similarity=dedup_high_similarity,
         )
@@ -200,6 +204,10 @@ class SchemaOrchestratingEvolver(OrchestratingEvolver, SourceUpdateSupport):
             self._index.update([source], mode=IndexWriteMode.ALL)
             updated_ids.append(source.id)
         return updated_ids
+
+    def structured_modalities(self) -> frozenset[Modality]:
+        # Schema extraction can report source evidence alone after extractor failure.
+        return frozenset()
 
     def _evolve_extract(self, units: list[MemoryUnit]) -> EvolveResult:
         if self._is_procedural(units):
@@ -340,6 +348,7 @@ def _build(config):
         abstractor=AbstractorProducer.dep(config, default="concat"),
         associator=AssociatorProducer.dep(config, default="keyword"),
         index_builder=hierarchy_index,
+        domain_store=_resolve_read_domain(config, hierarchy_index),
         storage=storage,
         message_store=_resolve_message_store(config),
         dedup=DedupProducer.dep(config, default=dedup_default),
@@ -352,5 +361,5 @@ def _build(config):
         schema_property_merge_planner=property_merge,
         kv_name=kv_name,
         dedup_medium_similarity=config.get("dedup_medium_similarity", 0.7),
-        dedup_high_similarity=config.get("dedup_high_similarity", 0.9),
+        dedup_high_similarity=config.get("dedup_high_similarity", 1.0),
     )

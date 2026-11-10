@@ -25,7 +25,7 @@ import threading
 
 from jiuwen_memory.common.errors import NotFoundError, ValidationError
 from jiuwen_memory.common.factory.factory import Factory
-from jiuwen_memory.common.log import get_logger
+from jiuwen_memory.common.log import get_logger, redact_for_log
 from jiuwen_memory.common.type_def import (
     COORDS_KEY,
     MD_FILENAME_KEY,
@@ -182,7 +182,8 @@ class LocalMarkdownStore(MarkdownStore):
                     fh.write(block)
 
     def replace_content(
-        self, scope: Scope, md_filename: str, old_content: str, new_content: str
+        self, scope: Scope, md_filename: str, old_content: str, new_content: str,
+        *, new_title: str | None = None, old_title: str | None = None,
     ) -> bool:
         """在 md 文件定位含 ``old_content`` 的块，替换为 ``new_content``（F07 §5.2.3）。
 
@@ -192,8 +193,9 @@ class LocalMarkdownStore(MarkdownStore):
         用 coords.team，其余用 MD_TITLE_KEY；与 unit_id 无关；尾部 ``\\n\\n`` 是块间
         分隔，切块后余下），正文 = 块去首行（标题）+ 去前导换行后的剩余单行。
 
-        命中后**整块替换**为 ``# {原标题}\\n{new_content}\\n\\n``：保留原块的首行（标题行），
-        只换正文——OVERWRITE 同 unit_id 原地改写（§5.2.1），标题行内容不在替换范围。
+        命中后同步替换正文和显式提供的 ``new_title``；None 保留原块首行，空串清空标题。
+        标题折叠为单行，避免破坏块结构。OVERWRITE 同 unit_id 原地改写（§5.2.1）。
+        ``old_title`` 非 None 时同时匹配旧标题，避免误改正文相同的其他块。
         块间分隔的 ``\\n\\n`` 由拼接复原。
 
         未命中（``old_content`` 不在文件任何块）返回 False——正常流程步骤 ③ 已改 content，
@@ -217,6 +219,19 @@ class LocalMarkdownStore(MarkdownStore):
             raw_blocks = text.split("\n\n")
             blocks = [b for b in raw_blocks if b]
 
+            # 标题只用于消歧；漂移时仅在正文唯一的情况下退化匹配。
+            matching_bodies = []
+            for block in blocks:
+                parts = block.split("\n", 1)
+                if len(parts) == 2 and parts[1] == old_content:
+                    matching_bodies.append(block)
+            title_found = any(
+                b.split("\n", 1)[0].strip() == f"# {old_title}"
+                for b in matching_bodies
+            )
+            if old_title is not None and not title_found and len(matching_bodies) == 1:
+                old_title = None
+
             replaced = False
             new_blocks: list[str] = []
             for block in blocks:
@@ -227,8 +242,10 @@ class LocalMarkdownStore(MarkdownStore):
                     new_blocks.append(block)
                     continue
                 title, body = parts[0], parts[1]
-                if body == old_content and not replaced:
-                    # 命中：整块替换为「原标题 + 新正文」，保留 unit_id（OVERWRITE 同 id）。
+                matches_title = old_title is None or title.strip() == f"# {old_title}"
+                if body == old_content and matches_title and not replaced:
+                    if new_title is not None:
+                        title = f"# {' '.join(new_title.split())}"
                     # 替换首个命中（old_content 重复时只改第一处，§5.2.3 注：重复 content
                     # 字符串匹配会误替多块——首版取首个，后续可加 unit_id 重载优化锚点）。
                     new_blocks.append(f"{title}\n{new_content}")
@@ -241,7 +258,7 @@ class LocalMarkdownStore(MarkdownStore):
                 return False
 
             # 还原：块间用 \n\n 拼接，末尾补 \n\n（与 _render_block 尾部 \n\n 对齐，
-            # 保证后续 write 追加 / 看门狗按行遍历口径不变）。
+            # 保证后续 write 追加 / 看门狗按块解析口径不变）。
             out = "".join(f"{b}\n\n" for b in new_blocks)
             # 原子写（S09 第 12 条）：``open("w")`` 打开瞬间即截断文件，``write`` 中途
             # 抛错（磁盘满/IO）会让旧内容永久丢失——补偿路径（update 失败回滚 shadow）
@@ -312,7 +329,7 @@ class LocalMarkdownStore(MarkdownStore):
                 return False
 
             # 还原：剩余块间用 \n\n 拼接，末尾补 \n\n（与 replace_content 口径一致，
-            # 保证后续 write 追加 / 看门狗按行遍历口径不变）。删空后 out 为空串，
+            # 保证后续 write 追加 / 看门狗按块解析口径不变）。删空后 out 为空串，
             # 写回空文件（全部块已删，与影子索引全删对齐）。
             out = "".join(f"{b}\n\n" for b in new_blocks)
             # 原子写（见 replace_content 同款）：写失败回写旧全文 ``text`` 恢复调用前状态，
@@ -384,7 +401,8 @@ class LocalMarkdownStore(MarkdownStore):
         切块、不要求 old_text 是整块正文），且**校验唯一性**（不唯一抛 ValidationError，
         非首版「取首个」）。对齐 agent-core edit_memory 契约（old_text 任意文本、跨块均可、
         必须唯一）。块结构重组（合并/拆分）交由上层 ``_supersede_shadow_for_md`` 按块解析
-        处理，md 侧只保证文件级替换的原子性与唯一性。
+        处理。USER.md/MEMORY.md 的单行正文编辑还会同步刷新未显式修改标题中的唯一
+        旧事实片段；无对应片段、跨块编辑或 daily 文件均不自动改写标题。
 
         失败语义：文件不存在 / old_text 未找到抛 ``NotFoundError``；old_text 不唯一抛
         ``ValidationError``；原子写失败经 :func:`_safe_restore` 回写读出的旧全文后重抛
@@ -410,6 +428,70 @@ class LocalMarkdownStore(MarkdownStore):
                     f"(found {count} occurrences): {old_text!r}"
                 )
             out = text.replace(old_text, new_text, 1)
+            # 文件工具通常只传正文；沿用旧事实标题会让 USER.md 显示相互矛盾的内容。
+            # 仅处理块结构未变、正文单行且标题未被显式编辑的情形；daily 标题是团队名。
+            if md_basename in ("USER.md", "MEMORY.md") and "\n" not in old_text:
+                old_blocks = text.split("\n\n")
+                new_blocks = out.split("\n\n")
+                if len(old_blocks) == len(new_blocks):
+                    for index, (old_block, new_block) in enumerate(zip(old_blocks, new_blocks)):
+                        old_parts = old_block.split("\n")
+                        new_parts = new_block.split("\n")
+                        if len(old_parts) != 2 or len(new_parts) != 2:
+                            continue
+                        if old_parts[0] != new_parts[0] or not old_parts[0].startswith("# "):
+                            continue
+                        if not old_parts[0][2:].strip() or not new_parts[1].strip():
+                            continue
+                        if old_parts[1] != new_parts[1]:
+                            old_body = old_parts[1]
+                            new_body = new_parts[1]
+                            prefix_len = 0
+                            while (
+                                prefix_len < min(len(old_body), len(new_body))
+                                and old_body[prefix_len] == new_body[prefix_len]
+                            ):
+                                prefix_len += 1
+                            suffix_len = 0
+                            while (
+                                suffix_len < min(
+                                    len(old_body) - prefix_len,
+                                    len(new_body) - prefix_len,
+                                )
+                                and old_body[-suffix_len - 1] == new_body[-suffix_len - 1]
+                            ):
+                                suffix_len += 1
+                            old_end = len(old_body) - suffix_len if suffix_len else len(old_body)
+                            new_end = len(new_body) - suffix_len if suffix_len else len(new_body)
+                            old_title = old_parts[0][2:].strip()
+                            candidates: list[tuple[int, str, str]] = []
+                            changed_len = old_end - prefix_len
+                            context_budget = len(old_title) - changed_len
+                            max_left = min(prefix_len, max(context_budget, 0))
+                            for left_len in range(max_left + 1):
+                                max_right = min(
+                                    suffix_len, max(context_budget - left_len, 0)
+                                )
+                                for right_len in range(max_right + 1):
+                                    old_candidate = old_body[
+                                        prefix_len - left_len:old_end + right_len
+                                    ]
+                                    if not old_candidate or old_title.count(old_candidate) != 1:
+                                        continue
+                                    new_candidate = new_body[
+                                        prefix_len - left_len:new_end + right_len
+                                    ]
+                                    candidates.append(
+                                        (len(old_candidate), old_candidate, new_candidate)
+                                    )
+                            if candidates:
+                                _, old_candidate, new_candidate = max(candidates)
+                                title = old_title.replace(old_candidate, new_candidate, 1)
+                            else:
+                                # “居住地”等概括性标题不含旧事实，无需随正文改写。
+                                title = old_title
+                            new_blocks[index] = f"# {title}\n{new_parts[1]}"
+                    out = "\n\n".join(new_blocks)
 
             # 原子写（见 replace_content 同款）：open("w") 截断后 write 抛错会让旧内容
             # 永久丢失——补偿路径（_supersede_shadow_for_md 回滚 shadow）救不回 md。
@@ -556,10 +638,10 @@ class LocalMarkdownStore(MarkdownStore):
         logger.info(
             "[trace/md] render block | title=%r | memory_class=%s | md_title_key=%s "
             "| team=%r | unit_id=%s",
-            title,
-            memory_class,
-            str((unit.system_metadata or {}).get(MD_TITLE_KEY) or ""),
-            (coords.get("team") if isinstance(coords, dict) else None)
+            redact_for_log(title),
+            redact_for_log(memory_class),
+            redact_for_log((unit.system_metadata or {}).get(MD_TITLE_KEY)),
+            redact_for_log(coords.get("team") if isinstance(coords, dict) else None)
             if memory_class == "daily_memory"
             else None,
             unit.id[:8],

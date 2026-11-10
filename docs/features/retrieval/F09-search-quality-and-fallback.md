@@ -81,3 +81,15 @@ embedding 对比使用独立重建的索引，固定 reranker；keyword-only、v
 真实 sqlite-vec 扩展虽已安装，相关单测并不等价于完整部署验证。
 此提交包含已验证的代码修复，不包含此前研究中发现但尚未实现的抽取质量、
 源文本长期归档、回答器推理或模型输出修复方案。
+
+## 上游同步适配（2026-11-10）
+
+合入当日 upstream/mem2.0，保留 staged retriever 的阶段拆分、可选 pipeline、
+项目检索与新的默认 agent profile 能力，同时保留语义精排能力护栏、分数校验、
+embedding 故障回退和有效期下推。prefetch 夹具补齐上游新增的初始化前置条件，
+不移除实际运行时门禁。清除 S03 上游遗留的日期冲突标记。
+
+Python 3.13.18 / pytest 8.4.2 的相关单测与 native ingestion 集成测试共 731 例通过；
+范围包含 retrieval 全目录、SQLite shadow、BGE/API scorer、adapter、evaluation、
+query pipeline 选择与 control pipeline 解析。相关改动文件 Ruff 检查通过。
+该结果不代表 Swarm 完整 SDK、全仓 CI、真实模型质量或新基准分数。

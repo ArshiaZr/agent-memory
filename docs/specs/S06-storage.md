@@ -5,9 +5,58 @@
 | 项 | 值 |
 |---|---|
 | 关联模块 | jiuwen_memory/storage/ |
-| 最近一次修订日期 | 2026-10-26 |
+| 最近一次修订日期 | 2026-11-10 |
 | 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md |
 | 关联特性文档 | docs/features/F01-system-spec-design.md，docs/features/api/F01-memory-api-impl-design.md，docs/features/construction/F07-memory-write-entry.md，docs/features/control/F02-control-isolation-and-audit.md，docs/features/control/F05-cloud-engine-design.md，docs/features/retrieval/F03-metadata-filtering.md，docs/features/retrieval/F05-storage-retrieval-pipelines.md，docs/features/common/F03-scope-space-isolation.md，docs/features/common/F08-memory-tree.md，docs/features/common/F04-security-interfaces-and-encryption.md，docs/features/storage/F03-postgres-backend.md，docs/features/storage/F04-storage-ssl.md，docs/features/storage/F05-unified-storage-design.md，docs/features/storage/F06-composite-recaller-assembly.md，docs/features/storage/F07-storage-manager-domain-store-split.md，docs/features/storage/F08-document-memory.md |
+## Markdown 块更新契约
+
+`MarkdownStore.replace_content(scope, md_filename, old_content, new_content, *,
+new_title=None, old_title=None) -> bool` 定位并替换首个符合条件的块。
+`new_title=None` 保留原标题，空串清空标题，非空标题归一为单行。
+`old_title` 非 None 时联合匹配标题与正文；标题漂移时仅在可替换块正文唯一时
+退化匹配，重复正文不猜测目标。候选统计与实际替换共用首个换行拆分口径，
+无换行的裸正文块不参与；未提供旧标题时按正文首个命中替换。
+未命中返回 False，`remove_content` 仍按正文删除首个命中。
+
+`edit_content` 要求 old_text 在文件全文中唯一，支持任意子串及跨块编辑。
+USER.md/MEMORY.md 单行正文变化时，可同步替换未显式编辑标题中的唯一旧事实片段；
+概括性标题、daily 团队标题及跨块编辑标题不自动改写。
+文件编辑后标题同步到 shadow，重复正文结合块位置和旧标题定位，不仅按哈希覆盖。
+标题与正文同次文件写入，shadow 更新失败时恢复文件快照并补偿索引。
+
+## 显式明文维护增量能力
+
+KVStore 增量提供非抽象 `compare_exchange(scope, key, expected, replacement) -> bool`：
+完整 Scope/key/value 原子匹配，保留原绝对到期时间；replacement=None 为比较删除。
+缺失、过期、变化返回 false，不创建记录。无法提供原子性时明确报不支持，禁止读后
+普通 update/delete 兜底。`migration_identity()` 返回仅供维护去重的物理位置身份，
+不能输出连接秘密。既有 ABC 抽象方法集合不变。
+SQLite 的 insert 在数据库写事务中判断缺失并以唯一主键插入，不能用 REPLACE 覆盖竞争
+写入；CAS 的有效期时钟在实例锁与 SQLite 写锁取得后采样，保留原绝对到期时间。
+
+受保护端口的可选 PlaintextMigrationTarget（storage/migration.py）契约包括
+migration_validate_scope/migration_identity/migration_scopes/migration_scan_supported/
+migration_records(scope, *, after="", max_value_bytes=...)/
+migration_key(unit_id)/migrate_plaintext(scope, key, expected, *, operation,
+existing_only=False)。记录扫描仅在已判权 Scope 内，密文仍需认证；迁移通过公开 provider
+加密，写前及持久化回读校验，现有记录以 CAS 保留 TTL。existing_only=true 禁止把扫描后
+消失或到期的记录重新插入。显式文件导入可插入缺失目标；clear 不删除密文。
+MigrationVerificationError.committed=true 标识提交后的回读失败，不自动回滚为明文。
+
+有界扫描须显式声明支持；KV 默认拒绝，不允许以全量 scan 兼容。migration_records 返回
+MigrationRecord(key, value, cursor) 迭代器，cursor 表示该条之后的位置；value=None 表示
+超过单条读取上限，后端须在传回 Python 前拒绝物化大值，工具报 record_too_large。
+KV 的可选 migration_read(scope,key,*,max_value_bytes) 同样在后端限值；None 表示超大，
+缺失抛 NotFoundError。转换前比较及提交后校验均须使用有界读取，不能退回普通 get。
+内存/SQLite/PG 按至多 64 个 key 分页并逐条有界读取；Redis 用 SCAN 游标及未处理 key
+列表保留页内进度，Lua STRLEN/GET 在一次原子调用中限制返回体。Redis SCAN 可重复键，
+已有转换须保持幂等；同一批预算耗尽时应返回续跑位置，不能丢掉未处理页内键。
+
+位置和保护依赖来自实际 manager 清单与公开插件能力，未知枚举/CAS 能力须明确失败。
+FS 资产、索引投影和治理记录不能按 MemoryUnit 猜测迁移；索引维持部署加密契约。
+非信封输入的专用 PlaintextDataError 仍在底层终止读取，沿原 BackendError 异常契约传播；
+存储不得返回原明文、错误对象冒充 bytes 或空内容。
+
 ## Metadata 物理存储契约
 
 索引记录保留 `system_metadata.<key>` 和 `user_metadata.<key>` 的逻辑路径。Milvus 与
@@ -111,8 +160,8 @@ PostgreSQL JSONB 使用完整路径作 key；Elasticsearch 写入时展开为对
     `DomainStore.get`/`list` 与 `load_units`/`list_units` helper，`KVStore.list`
     本身也按 `MEMORY_KEY_PREFIX` 扫描。这是正排作为唯一需要**两向投影**的索引形式的固有代价：
     实现分居两层，靠这对共享契约对齐。
-29. **命名数据面共享物理 Store 集**：`manager.domain_store(name)` 的多套命名数据面差异仅在
-    检索 profile（`preferred_retrieval_pipeline` + recallers 组合）；同名多次调用返回同一实例。
+29. **命名数据面使用受管 Store 集**：`manager.domain_store(name)` 的多套命名数据面可分别选择
+    受管真源 KV 端口与检索 profile（`preferred_retrieval_pipeline` + recallers 组合）；同名多次调用返回同一实例。
     跨 Store 集的整栈切换走 F02 Routing（`store_manager.active`），不属命名数据面语义。
 30. **所有 XXXStore 获取经 StoreManager**：消费者不直接调 Store Producer 解析具名后端
     （F07 起 `EntityStore` 一并纳入——写入侧 `HybridIndexBuilder` 与召回侧 `KeywordRecaller`
@@ -133,12 +182,25 @@ PostgreSQL JSONB 使用完整路径作 key；Elasticsearch 写入时展开为对
 
 ## 接口契约
 
+### 部署依赖加载时机
+
+配置选中的 ES 全文、ES 实体、Milvus 向量及 `milvus_graph` 融合后端在同步装配阶段
+预加载 ES/Milvus 客户端依赖（融合后端的图依赖仍惰性加载），
+避免长命服务首次请求在线程池中冷加载原生库；未选中的后端不因此引入部署依赖。
+预加载只导入模块，不建连、不建索引/集合；客户端连接及索引初始化仍为首次使用时执行。
+依赖导入或原生库加载失败在装配阶段以 `BackendError` 报错并保留原始异常链。
+ES 实体未配置 hosts/endpoint 时仍关闭该端口，不要求安装客户端。
+直接构造 Store 的手工接线仍保留惰性导入语义。
+这是将运行期冷加载前移到启动期的缓解措施，不代表已定位或修复 Windows loader
+底层慢加载机制；部署应为启动依赖加载保留时间。
+
 ### StoreManager（管理面，`store_manager.py`）
 
 | 类别 | 接口 | 语义 |
 |---|---|---|
 | 端口 | `kv/vector/fulltext/graph/fusion/fs/entity/markdown/shadow_index(name="default")` 及 `has_*(name="default")` | 暴露经过统一授权代理的完整 Store 契约；单一入口（无 property、无 `*_port` 后缀）；未声明端口抛 `UnsupportedStorageCapabilityError` |
 | 数据面 | `domain_store(name="default")` / `has_domain_store(name="default")` | 取命名数据面实例；实现需缓存（同名多次返回同一实例） |
+| KV 真源领域门面 | `domain_store_for_kv(name="default") -> DomainStore` | 绑定指定受管 KV 端口及 MemoryUnit codec，保留领域与端口授权；不继承默认数据面的 KV 选择、文档模式或召回配置，不注册/替换具名数据面，不承诺实例缓存；未实现时抛 UnsupportedStorageCapabilityError，公共基类不选择具体数据面实现 |
 | 能力 | `capabilities()` | 返回不可变标准端口能力集合 |
 | 横切 | `security` / `health()` | 统一授权入口并聚合全部命名端口的健康检查 |
 
@@ -414,6 +476,12 @@ SQLite :memory: 无落盘要求，但仍必须固定连接位置，拒绝初始�
 声明是运营方核查责任，不能冒充应用验证了远端磁盘。
 StoreSecurity.enabled() 仍表达 Store 内部保护，索引的外部保护通过部署声明与宿主检查表达。
 查询接口、BM25/ANN/原生过滤不变；本 PR 不新增密态检索或应用层全量解密检索路径。
+
+Linux 管理加密卷须为完整块设备路径受 dm-crypt 保护的 ext4，具有 has_journal 特性及
+可核查的非零内部 journal inode；非 ext4、无 journal、外部或无法核查的 journal 均拒绝。
+初始化只接受新建镜像，须显式选择 ext4 与 journal，并在报告成功前核查实际文件系统
+类型及内部 journal。格式化命令返回成功不能替代产物核查；失败须关闭已打开的临时
+mapper、保留镜像供排查，不自动覆盖或修复已有卷。挂载后仍独立验证同一契约。
 
 `StoreSecurity.encryption_binding` 是公开的可选装饰依赖契约，返回
 `StoreEncryptionBinding(inner, provider, format)`；原生保护实现可返回 None。
