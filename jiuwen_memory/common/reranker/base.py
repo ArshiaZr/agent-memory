@@ -27,6 +27,15 @@ class RerankerProducer(Factory):
 
 
 class Reranker(Plugin):
+    def supports_semantic_ranking(self) -> bool:
+        """Whether automatic retrieval may replace fused relevance with this scorer.
+
+        Existing model/custom implementations retain their previous behavior.
+        Lexical-only implementations must return False; callers can still request
+        them explicitly with RetrievalQuery.rerank=True.
+        """
+        return True
+
     @abstractmethod
     def rerank(self, query: str, texts: list[str]) -> list[float]:
         """对一批候选文本计算与 ``query`` 的相关性得分（顺序与输入一致，

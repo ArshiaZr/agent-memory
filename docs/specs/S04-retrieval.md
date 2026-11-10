@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 关联模块 | jiuwen_memory/retrieval/ |
-| 最近一次修订日期 | 2026-10-28 |
+| 最近一次修订日期 | 2026-11-10 |
 | 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md |
 | 关联特性文档 | docs/features/F01-system-spec-design.md、docs/features/construction/F04-cc-memory-compat.md、docs/features/construction/F05-construction-spec-multimodal-design.md、docs/features/retrieval/F02-retrieval-threshold-topk-design.md、docs/features/retrieval/F03-metadata-filtering.md、docs/features/retrieval/F04-score-max-fusion.md、docs/features/retrieval/F05-storage-retrieval-pipelines.md、docs/features/retrieval/F07-schema-temporal-entity.md、docs/features/retrieval/F08-query-rewrite.md、docs/features/common/F01-memory-layer.md、docs/features/common/F08-memory-tree.md、docs/features/storage/F06-composite-recaller-assembly.md |
 
@@ -365,6 +365,8 @@ metadata 比较保留 JSON 原生类型。查询侧不做 string / number / bool
 数组成员；`NE` / `NOT_IN` 分别按对应正向谓词取反。标量 `CONTAINS` 不退化为等值或
 字符串子串，数组 `EQ` / `IN` 也不退化为成员匹配。
 
+当前态在单次查询固定 `validity_time`，有效期起止在候选 top-k 前下推并以同一时钟复核；
+仍独立要求 ACTIVE（或显式允许的 ARCHIVED）。
 历史 `as_of` 查询追加 `lifecycle != forgotten`、`t_valid <= as_of`、
 `t_invalid > as_of`。开放有效期在索引中投影为 `T_INVALID_OPEN`，真源仍保持
 `t_invalid=None`；UnitReader 按真源 `[t_valid, t_invalid)` 区间复核。
@@ -423,7 +425,7 @@ metadata 比较保留 JSON 原生类型。查询侧不做 string / number / bool
 | `max_tokens` | int \| None | `None` | 展开时为根与后代共享的主字段预算 |
 | `with_trajectory` | bool | `False` | 是否返回轨迹 |
 | `channels` | list[RecallChannel] \| None | `None` | 覆盖召回通道 |
-| `rerank` | bool \| None | `None` | 覆盖重排开关 |
+| `rerank` | bool \| None | `None` | None 自动使用支持语义排序的 scorer；True 显式执行（含词法）；False 关闭 |
 | `include_archived` | bool | `False` | 是否纳入归档 unit |
 | `schema_temporal` | SchemaTemporalQuery \| None | `None` | 强类型 Schema 时序查询；未设置时可按配置自动识别时间意图 |
 | `extensions` | dict[str, Any] | `{}` | 调用级透传配置；`schema_temporal` 是内核保留键，本地调用可携带运行时对象 |
@@ -436,6 +438,10 @@ metadata 比较保留 JSON 原生类型。查询侧不做 string / number / bool
 | `query_context` | tuple[str, ...] \| None | `None` | 可选最近上下文；由 API 从 `Context.extensions["query_context"]` 校验并转换，仅上下文感知改写 parser 消费 |
 
 ### ParsedQuery
+
+额外跨层字段：`validity_time: datetime | None` 固定当前态复核时钟；
+`preparation_errors: list[ChannelError]` 承载查询向量化后端失败。BackendError 时词法检索继续，
+错误进入结果 errors/轨迹，不改变历史 as_of 或事件时间语义。
 
 | 字段 | 类型 | 语义 |
 |------|------|------|

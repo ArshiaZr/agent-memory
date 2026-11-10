@@ -16,13 +16,14 @@ import json
 import re
 
 from jiuwen_memory.common.embedder.base import Embedder, EmbedderProducer
+from jiuwen_memory.common.errors import BackendError, safe_error_message
 from jiuwen_memory.common.factory.factory import Factory
 from jiuwen_memory.common.feature_extractor.base import FeatureExtractor, FeatureExtractorProducer
 from jiuwen_memory.common.llm.base import LLM, LlmProducer
 from jiuwen_memory.common.log import get_logger
 from jiuwen_memory.common.tokenizer import Tokenizer
 from jiuwen_memory.common.tokenizer.base import TokenizerProducer
-from jiuwen_memory.common.type_def import ChatMessage
+from jiuwen_memory.common.type_def import ChannelError, ChatMessage
 from jiuwen_memory.retrieval.base import RetrievalOperatorType
 from jiuwen_memory.retrieval.query_parser import QueryParser, QueryParserProducer
 from jiuwen_memory.retrieval.types import ParsedQuery, RecallChannel, RetrievalQuery
@@ -220,9 +221,17 @@ class SimpleQueryParser(QueryParser):
         # 关键词与图通道都靠 token/关键词驱动；向量通道需有 Embedder。
         channels = [RecallChannel.KEYWORD, RecallChannel.GRAPH]
         vector: list[float] = []
+        preparation_errors: list[ChannelError] = []
         if self._embedder is not None:
-            vector = self._embedder.embed_query(rewritten)
-            channels.append(RecallChannel.VECTOR)
+            try:
+                vector = self._embedder.embed_query(rewritten)
+            except BackendError as exc:
+                preparation_errors.append(ChannelError(
+                    RecallChannel.VECTOR, "query_embedder", type(exc).__name__,
+                    safe_error_message(exc),
+                ))
+            else:
+                channels.append(RecallChannel.VECTOR)
 
         # 特征抽取：实体供图通道找种子，关键词并入 token 集（去重保序）。
         keywords = list(tokens)
@@ -257,6 +266,7 @@ class SimpleQueryParser(QueryParser):
             extensions=dict(query.extensions),
             rewrite_status=rewrite_status,
             rewrite_fallback_reason=rewrite_fallback_reason,
+            preparation_errors=preparation_errors,
         )
 
 

@@ -26,6 +26,10 @@ class OverlapReranker(Reranker):
     def health(self) -> None:
         return None
 
+    def supports_semantic_ranking(self) -> bool:
+        """Word overlap cannot safely replace semantic or fused relevance."""
+        return False
+
     def rerank(self, query: str, texts: list[str]) -> list[float]:
         q = set(self._tokenizer.tokenize(query))
         if not q:

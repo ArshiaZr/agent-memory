@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from datetime import UTC, datetime
+from math import isfinite
 from time import perf_counter
 from uuid import uuid4
 
@@ -296,8 +298,10 @@ class PipelineRetriever(Retriever):
 
         # [3a] 前置谓词：系统谓词（lifecycle×as_of / 时间窗）与用户表达式 AND 外包一同下推。
         #      用户表达式作整体 child——绝不摊平，防其 OR 稀释 lifecycle 等安全谓词。
+        parsed.validity_time = datetime.now(UTC)
         sys_filters = build_hierarchy_filters(candidate_hierarchy) + build_system_filters(
-            parsed.as_of, parsed.time_from, parsed.time_to, query.include_archived
+            parsed.as_of, parsed.time_from, parsed.time_to, query.include_archived,
+            current_time=parsed.validity_time,
         )
         user_filters = parsed.scalar_filters  # parser 已 normalize 的用户表达式（供 §6 复核）
         if query.rollup:
@@ -370,6 +374,7 @@ class PipelineRetriever(Retriever):
             ]
             errors = ranked.errors
 
+        errors = [*parsed.preparation_errors, *errors]
         for error in errors:
             logger.warning(
                 "Retriever.recall degraded: trace_id=%s scope_dims=%s channel=%s "
@@ -431,6 +436,17 @@ class PipelineRetriever(Retriever):
         # [7] 可选重排：内容已物化，按 ParsedQuery.rewritten 的相关性精排
         do_rerank = query.rerank if query.rerank is not None else (self._reranker is not None)
         reranked = False
+        if (
+            do_rerank
+            and query.rerank is None
+            and self._reranker is not None
+            and not self._reranker.supports_semantic_ranking()
+        ):
+            record_step(
+                "rerank", 0.0, n=len(survivors),
+                detail={"skipped": "lexical_reranker_requires_explicit_opt_in"},
+            )
+            do_rerank = False
         if do_rerank and self._reranker is not None and survivors:
             t0 = perf_counter()
             try:
@@ -443,6 +459,13 @@ class PipelineRetriever(Retriever):
                     self._rerank_max_doc_chars,
                 )
                 scores = self._reranker.rerank(query_text, doc_texts)
+                if not isinstance(scores, (list, tuple)) or len(scores) != len(survivors) or any(
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not isfinite(score)
+                    for score in scores
+                ):
+                    raise BackendError("Reranker returned invalid scores or a score-count mismatch")
             except BackendError as exc:
                 detail = {
                     "skipped": "reranker_unavailable",

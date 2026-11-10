@@ -46,6 +46,10 @@
 
 ## 行为铁律
 
+Reranker 的 `supports_semantic_ranking()` 声明自动替换融合排序是否安全；纯词法 overlap
+返回 False。模型/自定义实现默认 True，RoutingReranker 必须转交 active 实例的声明。
+`ParsedQuery.validity_time` 固定当前态复核时钟；`preparation_errors` 记录可降级的通道后端错误。
+
 - **静态保护能力注册**：Factory 的 config_inspectors 随 target 注册或替换，
   registration_scope 同时恢复 builder 与检查器，不改变 AssemblyContext 的缓存所有权。
   audit/permission 与 Grant/Delegation 的 SQLite 插件声明 db_path；内存 SQLite 仅免

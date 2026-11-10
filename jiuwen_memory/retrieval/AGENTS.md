@@ -43,7 +43,8 @@
 4. Fuser 前完成真源复核，再对 ScoredMemoryUnit 做分层归并和跨通道融合
 5. 截断精排预算 budget = fused[:max(rerank_max, top_k)]
      ↓
-6. 可选 Reranker 用 `ParsedQuery.rewritten` 精排（记 calibrated 标志；fallback/off 时该值即 sanitized raw）
+6. 自动 Reranker 仅使用 supports_semantic_ranking=True 的 scorer；词法 scorer 需 rerank=True 显式请求。
+   用 ParsedQuery.rewritten 精排；分数数量不符/非有限值降级保留融合结果
      ↓
 7. 相关性阈值：绝对 min_score（仅校准路径）+ 相对 ratio（校准/未校准两路，默认关闭）
      ↓ + min_results 从正分候选兜底回填（结果数可 < top_k）
@@ -90,6 +91,9 @@ L0/L1 分层检索在 content（L2）之外，额外召回预生成的概要（L
 
 6. **双时间轴独立**
    `as_of`（valid-time 回溯点，问"T 时刻哪个版本有效"）与 `time_from/time_to`（event-time 范围，问"事件发生在何时"）是两条独立时间轴，不可混用。
+
+   当前态用 `ParsedQuery.validity_time` 在有效期下推与真源复核之间共享一次 UTC 时钟。
+   QueryParser 向量化的 BackendError 进入 preparation_errors；关键词/图通道可继续。
 
 7. **生产过滤必须先于 top-k**
    Milvus / Elasticsearch / pgvector 必须在 limit 前完整下推系统谓词与用户 FilterExpr。

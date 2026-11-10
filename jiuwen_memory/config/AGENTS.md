@@ -24,6 +24,9 @@
 
 ## 行为铁律
 
+- `RoutingReranker.supports_semantic_ranking()` 随 active scorer 透传，不能继承默认 True
+  而把 overlap 误认成可自动替换语义融合分的模型。
+
 1. **默认可运行**  
    未自定义时默认 `config_source.target=yaml_defaults`，行为对齐 `defaults.py` + 用户 YAML 合并结果。
 

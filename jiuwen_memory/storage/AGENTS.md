@@ -274,6 +274,9 @@ DocumentIndexBuilder 委托 DomainStore，ShadowDedup 读取 shadow。文档模�
 
 SQLite 影子索引的 temporal 列复用 common/time_utils.epoch_ms，与构建投影和真源过滤一致；缺值哨兵保持字段原有契约。
 
+SQLite 下推 `NOT(t_valid > T)` 为 `t_valid IS NULL OR t_valid <= T`，在 recall limit
+前排除尚未生效的记录并保留开放起点。其它不完整的 NOT 子树不得部分取反下推。
+
 ### 结构查询消费
 
 CompositeDomainStore 与 KeywordRecaller 的真源候选检查传入完整 ParsedQuery；

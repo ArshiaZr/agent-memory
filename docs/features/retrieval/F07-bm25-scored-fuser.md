@@ -84,5 +84,5 @@ fuser:
 
 1. **IDF 与 avgdl 来自候选池而非全集合**。`Fuser` 接口拿不到全局统计；池宽为 `recall_max × 在场通道数`，是召回后可得的最宽样本，但输出是**池相对**词法强度，不是跨集合可比的绝对分——归一化到池最大值后再参与组合，正是为了能与其它通道安全比较。
 2. **CombMAX 头部并列**。各轴最优候选均归一化为 1.0，列表头部可能并列。此为 `score_max` 既有行为，非本次引入。
-3. **`rerank_enabled: true` 时本算子效果被覆盖**。`PipelineRetriever` 在 rerank 后以 `replace(survivors[i], score=scores[i])` 同时替换顺序与分数，而 `globals.rerank_enabled` 出厂为 `True` 且默认 reranker 是 `overlap`——该配置下本算子无可观察效果。基准计划含第 4 臂用数据回答，不以阻塞方式处理。
+3. **显式 `rerank=True` 或模型精排仍会替换融合分**。自动路径现按 [F09](F09-search-quality-and-fallback.md) 跳过 overlap，保留本算子效果；以下为原验证基线的覆盖风险。`PipelineRetriever` 在 rerank 后以 `replace(survivors[i], score=scores[i])` 同时替换顺序与分数，而 `globals.rerank_enabled` 出厂为 `True` 且默认 reranker 是 `overlap`——该配置下本算子无可观察效果。基准计划含第 4 臂用数据回答，不以阻塞方式处理。
 4. **是否升级为出厂默认**未定，留待基准结果与评审决定。

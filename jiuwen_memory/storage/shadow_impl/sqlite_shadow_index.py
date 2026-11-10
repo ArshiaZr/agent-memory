@@ -288,7 +288,15 @@ def _compile_system_filters(expr) -> tuple[str | None, list]:
         if not parts:
             return None, []
         return " OR ".join(parts), params
-    # NOT：build_system_filters 不产生系统 NOT 谓词，放弃下推（点读后复核兜底）。
+    # 只处理有效期起点的完整单叶否定；不能否定已经丢失未知 child 的部分 AND。
+    if expr.logic is FilterLogic.NOT and len(expr.children) == 1:
+        child = expr.children[0]
+        if (
+            isinstance(child, FilterClause)
+            and child.field == "t_valid"
+            and child.op is FilterOp.GT
+        ):
+            return "(t_valid IS NULL OR t_valid <= ?)", [child.value]
     return None, []
 
 

@@ -182,6 +182,10 @@ class RoutingReranker(Reranker):
         """委托当前 active Reranker 探活。"""
         self._router.get().health()
 
+    def supports_semantic_ranking(self) -> bool:
+        """能力随当前 active 实例解析，不把词法 scorer 伪装为语义模型。"""
+        return self._router.get().supports_semantic_ranking()
+
     def rerank(self, query: str, texts: list[str]) -> list[float]:
         """委托当前 active Reranker 打分。"""
         return self._router.get().rerank(query, texts)

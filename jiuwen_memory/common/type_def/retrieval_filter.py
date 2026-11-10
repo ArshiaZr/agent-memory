@@ -24,13 +24,14 @@ def valid_at(unit: MemoryUnit, as_of: datetime) -> bool:
 
 
 def passes_lifecycle(
-    unit: MemoryUnit, as_of: datetime | None, include_archived: bool = False
+    unit: MemoryUnit, as_of: datetime | None, include_archived: bool = False,
+    *, now: datetime | None = None,
 ) -> bool:
     if as_of is None:
         allowed = {LifecycleState.ACTIVE}
         if include_archived:
             allowed.add(LifecycleState.ARCHIVED)
-        return unit.lifecycle in allowed and valid_at(unit, datetime.now(UTC))
+        return unit.lifecycle in allowed and valid_at(unit, now or datetime.now(UTC))
     return unit.lifecycle != LifecycleState.FORGOTTEN and valid_at(unit, as_of)
 
 
@@ -57,7 +58,7 @@ def is_retrieval_candidate(
 ) -> bool:
     """复用解析查询复核候选，同时保留调用路径选择的真源过滤表达式。"""
     return (
-        passes_lifecycle(unit, query.as_of, query.include_archived)
+        passes_lifecycle(unit, query.as_of, query.include_archived, now=query.validity_time)
         and in_event_window(unit, query.time_from, query.time_to)
         and matches_hierarchy(unit, HierarchyQuery.from_query(query))
         and matches_retrieval_filters(unit, filters)

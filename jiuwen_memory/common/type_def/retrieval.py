@@ -68,6 +68,8 @@ class ParsedQuery:
     span_end: datetime | None = None
     rewrite_status: str = "off"  # off / used / fallback / no_intent
     rewrite_fallback_reason: str = ""  # 仅 fallback 状态有值
+    validity_time: datetime | None = None  # 单次当前态查询的固定有效性时钟
+    preparation_errors: list[ChannelError] = field(default_factory=list)
 
 
 @dataclass

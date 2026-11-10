@@ -5,7 +5,7 @@
 | 项 | 值           |
 |---|-------------|
 | 关联模块 | jiuwen_memory/common/ |
-| 最近一次修订日期 | 2026-10-26 |
+| 最近一次修订日期 | 2026-11-10 |
 | 关联特性补充 | docs/features/api/F04-memory-metadata-separation.md |
 | 规划中的变更 | 见 [F07-collective-memory-design.md](../features/control/F07-collective-memory-design.md)「metadata 键」与「空间事实的传入通道」 |
 | 关联特性文档 | docs/features/F01-system-spec-design.md，docs/features/api/F01-memory-api-impl-design.md，docs/features/construction/F04-cc-memory-compat.md，docs/features/common/F01-memory-layer.md，docs/features/common/F02-dashscope-llm-provider.md，docs/features/common/F03-scope-space-isolation.md，docs/features/common/F04-security-interfaces-and-encryption.md，docs/features/control/F02-control-isolation-and-audit.md，docs/features/retrieval/F03-metadata-filtering.md，docs/features/common/F05-model-service-ssl.md，docs/features/common/F06-distributed-lock.md，docs/features/config/F01-config-source.md，docs/features/ingest/F02-assets-ingestor-boundary.md |
@@ -204,6 +204,12 @@ DashScope Adapter 的 `params.enable_thinking` 由 Adapter 转换为
 | 方法 | 签名 | 语义 |
 |------|------|------|
 | `rerank` | `(query: str, texts: list[str]) -> list[float]` | 对每条 text 计算与 query 的相关性得分 |
+| `supports_semantic_ranking` | `() -> bool` | 是否允许自动检索用该 scorer 替换融合相关性；默认 True 保持模型/自定义实现兼容，纯词法实现必须覆写为 False |
+
+自动检索（`rerank=None`）跳过不支持语义排序的 scorer，保留融合顺序和分数并走未精排阈值。
+`rerank=True` 是显式词法实验的兼容入口；`False` 关闭精排。Routing 门面透传 active 实例的能力。
+分数必须与输入候选一一对应且数值有限；非法分数按后端失败保留融合结果。
+该能力不声明概率校准，也不保证模型在任意问题上的排序正确。
 
 ### AuditLogger（`audit/base.py`）
 

@@ -143,6 +143,12 @@ class TestPrepareEnvelope:
 
 
 class TestRecallFilters:
+    def test_project_and_tier_filters_are_both_required(self):
+        assert _recall_filters("alpha") == {
+            "tier": {"in": ["semantic", "core", "procedural"]},
+            "system_metadata.project": {"in": ["", "alpha"]},
+        }
+
     def test_filters_include_distilled_tiers_only(self):
         assert _recall_filters() == {"tier": {"in": ["semantic", "core", "procedural"]}}
 
@@ -151,6 +157,22 @@ class TestRecallFilters:
         assert "episodic" not in flattened
         assert "working" not in flattened
         assert "archival" not in flattened
+
+
+def test_prefetch_forwards_project_without_dropping_tier_filter():
+    from types import SimpleNamespace
+
+    seen = []
+
+    async def search(query, scope, *, top_k, filters):
+        seen.append(filters)
+        return [{"content": "project-specific espresso preference"}]
+
+    provider = AgentMemoryMemoryProvider()
+    provider._client = SimpleNamespace(search=search)
+    result = asyncio.run(provider.prefetch("coffee preference", project=" alpha "))
+    assert "espresso" in result
+    assert seen == [_recall_filters("alpha")]
 
 
 # --------------------------------------------------------------------------- #

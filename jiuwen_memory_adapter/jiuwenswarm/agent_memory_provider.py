@@ -143,7 +143,7 @@ SEARCH_SCHEMA: dict[str, Any] = {
             "project": {
                 "type": "string",
                 "description": (
-                    "Project coordinate; omit to search across all projects. When "
+                    "Project coordinate; omit to search shared memories only. When "
                     "set, recalls this project's memories plus cross-project memories."
                 ),
             },
@@ -264,14 +264,17 @@ _BREAKER_COOLDOWN = 120.0
 _RECALL_TIERS = ("semantic", "core", "procedural")
 
 
-def _recall_filters() -> dict[str, Any]:
+def _recall_filters(project: str = "") -> dict[str, Any]:
     """prefetch 召回过滤（dict DSL，HTTP/进程内两模式共用）。
 
     实测确认（design doc §8.2.1）：``{"tier": {"in": [...]}}`` 被服务端真实执行，
     episodic 原文被正确排除。进程内路径经 ``RetrievalQuery`` 边界的 ``normalize``
     接收同一份 dict DSL。
     """
-    return {"tier": {"in": list(_RECALL_TIERS)}}
+    filters: dict[str, Any] = {"tier": {"in": list(_RECALL_TIERS)}}
+    if project:
+        filters["system_metadata.project"] = {"in": ["", project]}
+    return filters
 
 
 def _agent_default_config() -> dict[str, Any]:
@@ -910,7 +913,7 @@ class AgentMemoryMemoryProvider(MemoryProvider):
                 search_query,
                 self.bound_scope(),
                 top_k=top_k,
-                filters=_recall_filters(),
+                filters=_recall_filters(str(kwargs.get("project") or "").strip()),
             )
             logger.info("[AgentMemoryMemoryProvider] prefetch after search items=%d", len(items))
             lines = [it.get("content", "") for it in items if it.get("content")]

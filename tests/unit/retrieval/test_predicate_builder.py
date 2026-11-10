@@ -24,7 +24,8 @@ NOW = datetime(2026, 6, 16, tzinfo=UTC)
 def test_current_query_emits_active_in() -> None:
     clauses = build_system_filters(None, None, None)
 
-    lifecycle = [c for c in clauses if c.field == "lifecycle"][0]
+    lifecycle = [c for c in iter_clauses(FilterGroup(FilterLogic.AND, clauses))
+                 if c.field == "lifecycle"][0]
     assert lifecycle.op == FilterOp.IN
     assert lifecycle.value == ["active"]
 
@@ -32,7 +33,8 @@ def test_current_query_emits_active_in() -> None:
 def test_include_archived_widens_lifecycle() -> None:
     clauses = build_system_filters(None, None, None, include_archived=True)
 
-    lifecycle = [c for c in clauses if c.field == "lifecycle"][0]
+    lifecycle = [c for c in iter_clauses(FilterGroup(FilterLogic.AND, clauses))
+                 if c.field == "lifecycle"][0]
     assert set(lifecycle.value) == {"active", "archived"}
 
 
@@ -78,7 +80,7 @@ def test_event_time_window_emits_or_group_with_unknown_sentinel_branch() -> None
     clauses = build_system_filters(None, time_from, time_to)
 
     # 事件窗元素是顶层 OR FilterGroup（不再是扁平 FilterClause）
-    event_exprs = [c for c in clauses if isinstance(c, FilterGroup)]
+    event_exprs = [c for c in clauses if isinstance(c, FilterGroup) and c.logic is FilterLogic.OR]
     assert len(event_exprs) == 1, "事件窗应为单个 OR FilterGroup"
     or_group = event_exprs[0]
     assert or_group.logic is FilterLogic.OR
@@ -106,7 +108,7 @@ def test_event_time_window_only_from_emits_or_group_with_unknown_branch() -> Non
     """仅 time_from（time_to=None）时，AND 子组只含 GTE 一叶；OR 仍含 EQ 哨兵分支。"""
     clauses = build_system_filters(None, NOW, None)
 
-    or_groups = [c for c in clauses if isinstance(c, FilterGroup)]
+    or_groups = [c for c in clauses if isinstance(c, FilterGroup) and c.logic is FilterLogic.OR]
     assert len(or_groups) == 1
     or_group = or_groups[0]
     assert or_group.logic is FilterLogic.OR
@@ -120,4 +122,4 @@ def test_event_time_window_only_from_emits_or_group_with_unknown_branch() -> Non
 def test_no_time_window_emits_no_or_group() -> None:
     """无 time_from / time_to 时不应构造 OR 组——只返回 lifecycle/as_of clauses。"""
     clauses = build_system_filters(None, None, None)
-    assert not any(isinstance(c, FilterGroup) for c in clauses)
+    assert not any(isinstance(c, FilterGroup) and c.logic is FilterLogic.OR for c in clauses)
