@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+evaluation = ["ijson>=3.3"]
 dev = [
     "pytest>=8.0,<9.0",
     "pytest-cov>=6.0,<7.0",

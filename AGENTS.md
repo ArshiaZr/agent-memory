@@ -118,3 +118,9 @@ commit message scope 固定用 `memory`（如 `feat(memory): ...`、`fix(memory)
 footer 用 `Refs: #<issue>` 关联 issue；issue 号无法从上下文确认时必须先询问用户，不要臆造。
 
 每个实现 PR 最终交付一个合并提交，统一包含实现代码、测试和相关文档，细则见上文「设计文档归档与双向同步」约束 #1。
+
+## 实验批量摄入
+
+`evaluation/ingestion` 提供完整源历史摄入、SQLite 检查点及评测前完成门禁；
+用法见其 README，契约见 docs/specs/S11-evaluation-ingestion.md。
+旧 LongMemEval no-source runner 是独立诊断，不自动遵循新门禁。

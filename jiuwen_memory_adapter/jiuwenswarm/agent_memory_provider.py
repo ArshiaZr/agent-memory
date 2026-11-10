@@ -418,6 +418,15 @@ def _agent_default_config() -> dict[str, Any]:
     }
 
 
+def agent_default_config() -> dict[str, Any]:
+    """Return a fresh native agent profile for trusted experiment composition roots.
+
+    This is the same profile used by the Swarm SDK adapter. Callers must inject
+    their own trusted authentication and identify any storage/model overrides.
+    """
+    return _agent_default_config()
+
+
 def _merge_config_over_default(config_dict: dict[str, Any]) -> dict[str, Any]:
     """[本地修改 2026-10-20] 把上层 ``config_dict`` 深合并到内置 agent 默认装配之上。
 
